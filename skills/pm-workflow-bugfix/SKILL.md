@@ -64,7 +64,7 @@ PM 按 `docs/workflow_worktree_sessions_async.md` §4 执行：
 | Stage | Agent    | 操作                          |
 |-------|----------|-------------------------------|
 | 1     | Daedalus | 实现 fix → commit → 报告完成  |
-| 2     | Themis   | 代码审查 → 写入 review report |
+| 2     | Themis   | 代码审查 → 直接回复 PM |
 | 3     | Argus    | 修 findings → commit          |
 | 4     | QA       | 验证 + 补测 → QC 报告         |
 
