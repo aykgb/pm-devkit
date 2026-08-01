@@ -78,7 +78,7 @@ PM 通过 `curl POST /prompt_async` 异步派发，通过 `curl GET /status` 轮
 
 ## 步骤 ⑥：同步 Windows + 验证
 
-执行 Windows 代码同步（`ssh wangc@120.53.123.68 -p 19238 "git -C C:\\Users\\wangc\\xidi-minimal fetch origin main && git -C C:\\Users\\wangc\\xidi-minimal reset --hard origin/main"`），用户验证。
+执行 Windows 代码同步（MCP `remote_exec` `git fetch origin main && git reset --hard origin/main`），用户验证。
 
 ## 关键边界
 

@@ -16,7 +16,7 @@
     }
   },
   "instructions": [
-    ".pm/operational_conventions.md"
+    "docs/operational_conventions.md"
   ],
   "default_agent": "PM",
   "small_model": "opencode/deepseek-v4-flash-free",

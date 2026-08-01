@@ -96,7 +96,7 @@ docs/
 | 文件 | 来源 | 创建方式 |
 |------|------|---------|
 | `.pm/project_memory.md` | `.pm/devkit/templates/pm/project_memory.md` | PM 直接写（填入项目名 + 当前 Phase） |
-| `.pm/operational_conventions.md` | `.pm/devkit/templates/pm/operational_conventions.md` | PM 直接写 |
+| `docs/operational_conventions.md` | `.pm/devkit/templates/pm/operational_conventions.md` | PM 直接写 |
 | `.pm/persona.md` | 模板项目 `persona.md` | PM 直接写（含管理模式 + 闲聊模式） |
 | `.pm/user_profile.md` | 空模板（头部 + 分类占位） | PM 直接写 |
 | `.pm/user_behavior.md` | 空模板（统计初始化为 0） | PM 直接写 |
@@ -155,7 +155,7 @@ docs/
 | 文件 | 说明 |
 |------|------|
 | `.pm/project_memory.md` | Agent 派发 · Spec 拆解 · Batch 设计 |
-| `.pm/operational_conventions.md` | OC0-OC5 操作约定 |
+| `docs/operational_conventions.md` | OC0-OC5 操作约定 |
 | `.pm/persona.md` | PM 双模式语气定义 |
 | `.pm/user_profile.md` | 用户画像（空） |
 | `.pm/user_behavior.md` | 行为日志（空） |

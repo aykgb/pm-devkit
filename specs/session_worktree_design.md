@@ -411,4 +411,4 @@ busy→idle
 | `scripts/session-status-server.mjs` | Sidecar 进程（Node，L1~648） |
 | 命令操作参考 | 已内置 PM system prompt |
 | `docs/development_workflow.md` | 7 步流水线流程 |
-| `.pm/operational_conventions.md` §OC5 | 约束级规则 |
+| `docs/operational_conventions.md` §OC5 | 约束级规则 |
