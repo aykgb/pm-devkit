@@ -7,26 +7,26 @@
 ## 1. PM 域文件体系
 
 ```
-.pm/                          ← 记忆系统
+.pm/                          ← 记忆系统（submodule 内）
   project_memory.md           ← 核心：Agent 派发 · 拆解 · Batch · 交互历史
-  operational_conventions.md  ← 操作约定
   persona.md                  ← PM 语气
   user_profile.md             ← 用户画像
   user_behavior.md            ← 行为日志
   chats/ + reflections/       ← 闲聊 + 反思
-  design/                     ← PM 自身设计（submodule，项目无关）
+  devkit/                     ← PM 自身设计（submodule，项目无关）
 
-.opencode/                    ← Agent 定义 + Skills
-  agents/*.md                 ← N 个 agent 定义
-  skills/pm-workflow-*/       ← I/S/N/F/L/M/R/B 工作流
-
-docs/                         ← 项目文档
+docs/                         ← 项目文档（OC 源文件也在此）
+  operational_conventions.md  ← 操作约定（OC0-OC5，权威源）
   impl_plan.md                ← Phase 拆解（唯一 Source of Truth）
   architecture.md + data_model.md
   development_workflow.md     ← 流水线权威
   project_tasks.md            ← 任务状态索引
   development_log.md          ← 历史单表
   task_specs/ + review_report/
+
+.opencode/                    ← Agent 定义 + Skills
+  agents/*.md                 ← N 个 agent 定义
+  skills/pm-workflow-*/       ← I/S/N/B/D/i/T/F/L/M/R/C 12 个工作流
 ```
 
 ## 2. 角色矩阵
@@ -55,22 +55,24 @@ Todo → In Progress → Done → Recently Completed
 
 ## 4. 提交与分支
 
+双分支模型：`main` 稳定发布分支（worktree pool 基于 main checkout feature，PR→main）；`iter` 常驻迭代分支（main agents 在此工作，快速修复直接提交 iter，定期 PR→main）。Windows 环境始终同步 `iter`。
+
 | 谁 | 域 | 方式 |
 | --- | --- | --- |
-| PM | 记忆/文档域 | 直推 main |
-| 开发 Agent | `src/` `tests/` `db/` | PR |
-| General | 工具链代码 | fix/feat 分支 → PR |
+| PM | 记忆/文档域 | 直推 iter（OC2.7）；仅文档增删改可上 main |
+| 开发 Agent | `src/` `tests/` `db/` | PR → main |
+| General | 工具链代码 | fix/feat 分支 → PR → main |
 | 任何人 | 破坏性操作 | 先征询 |
 
 - 分支：`feat_P<N>_T<M>_<task>` / `fix-<slug>`
 - Commit：`<type>(<scope>): [<agent>] <description>`
-- main 只做文档增删改；PM 禁止 merge
+- PM 禁止 merge（OC2.5）；仅允许 iter 变基（`iter rebase main`）与 Iterate 工作流 cherry-pick → iter
 
 ## 5. Backlog 管理
 
 来源：审查 P2 / 门禁 Med+Low / CI Bot P2 / QA 非阻断。
 不进入：typo / 单行 Nit / PM 裁决忽略。
-清扫：关/修/留三分类 → QA Agent 执行。原则：低优全量追踪。
+清扫：关/修/留三分类 → 杂务 Agent（Janitor）执行。原则：低优全量追踪（OC3.4）。
 
 ## 6. 文档关系图
 

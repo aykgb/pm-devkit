@@ -13,9 +13,11 @@ Phase 目标（impl_plan.md §N）
   → General 读源码 grep 验证 → 产出 task_specs/P<N>-T<M>.md + 代码预估
   → PM 核验 spec 逻辑自洽性
   → PM 编组 Batch（按 §2 标准）
-  → Spec 门禁审视（正式 Phase 任务强制）
+  → Spec 门禁审视（所有任务强制，含 BL-*）
   → Fix loop → PASS → spec 就位，可派发
 ```
+
+> 委托 General 完整拆解时 prompt：「加载 `pm-workflow-spec-breakdown` skill，按步骤产出 `docs/task_specs/` 文件，不做 Batch 编组和门禁——那是我（PM）的步骤。各 task spec 文件仅含设计片段，禁止大段代码，禁止改 `project_tasks.md`」。
 
 ### PM 派 General 拆解
 
@@ -46,9 +48,11 @@ PM 不读代码，不口述 spec 细节。给出：
 
 ### Spec 门禁 + Fix Loop
 
-- 触发：正式 Phase 任务（`P<N>-T<N>`）spec 就位后
-- 跳过：清扫类（`BL-*`）单独成批
+- 触发：**所有任务**（`P<N>-T<N>` 和 `BL-*`）派发前必须经 Spec 门禁审视（OC3.5 强制门禁）
+- 入口不限于 Workflow N——直接指令、PM 自行拆解、委托 General 全流程均可
 - Fix loop：Blocker + High 全修 → 重审 → 循环直到 PASS
+- **OC3.5 约束**：门禁报告中所有 findings（含 Blocker / High / Medium / Low）必须全部修复才能派发实现。特殊情况可在 PM 裁决后降级处理（如 Medium 转 Backlog），但必须显式决策并记录
+- 简单批次（≤3 任务、纯文档、纯清扫）可跳过 R2/R3 轮
 
 ---
 

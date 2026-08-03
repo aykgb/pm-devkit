@@ -26,8 +26,8 @@
 │  │         Agent Dispatch Layer            │              │
 │  │                                         │              │
 │  │  pool dispatch wt_N <dev-agent> --task "..." --yes    │
-│  │  session dispatch <sid> General                       │
-│  │  task(subagent_type="Janitor")                        │
+│  │  session dispatch <sid> General / 门禁 / 审查 / 杂务   │
+│  │  task(subagent_type="explore"/"WebSearch")             │
 │  └────────────────────────────────────────┘              │
 └──────────────────────────────────────────────────────────┘
              │
@@ -76,7 +76,7 @@ main worktree
   → 审查/测试由开发者手动执行或 CI 自动跑
 ```
 
-最简模式下仍提供 I/S/N/F/L/M/R 工作流，但依赖 pool 的 Workflow（B bugfix 的 per-fix wt）不可用。PM 角色从"全自动调度器"退化为"结构化引导者"。
+最简模式下仍提供 I/S/N/F/L/M/R 等核心工作流，但依赖 pool 的 Workflow（标准 7 步 D(evelop)、T(oolchain) PR 路径）不可用。PM 角色从"全自动调度器"退化为"结构化引导者"。
 
 ## 5. 迭代自愈
 

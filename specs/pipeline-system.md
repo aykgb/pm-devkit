@@ -8,23 +8,35 @@
 
 | 改动 | 流程 | worktree | 审查 |
 | --- | --- | --- | --- |
-| 业务代码 | **标准 7 步** | pool wt | 审查 Agent + CI Bot |
+| 业务代码 | **标准 7 步** | pool wt | 审查 Agent + Codex bot |
 | 工具链代码 | **工具链闭环**（General 一人） | main wt | 跳过 |
-| PM 域文档 | PM 直推 main | main wt | 跳过 |
-| Bugfix | 快速修复流程 | per-fix wt | 可选 |
+| PM 域文档 | PM 直推 iter | main wt | 跳过 |
+| Bugfix / 小功能（≤200 行） | **轻量迭代**（explore 定位 → General 分支修复 → cherry-pick/PR） | iter 分支 | 可选 |
 
-> **裁减**：开发者可按复杂度跳过审查/QA/CI Bot 步骤。
+> **裁减（OC5.8）**：开发者可按复杂度跳过审查/QA/Codex 步骤。
 
 ## 2. 标准 7 步
 
 ```
-① pool prepare → ② 开发 Agent → ③ 审查 Agent → ③.5 CI Bot
+① pool prepare → ② 开发 Agent → ③ 审查 Agent → ③.5 Codex（PR review bot）
   → ④ QA Agent → ⑤ 开发者 merge → ⑥ pool release → ⑦ PM 收口
 ```
 
-**3 个铁律**：同 wt 串行不 release / 审查 P0/P1 零容忍 / PM 禁止 merge。
+**3 个铁律**：同 wt 串行不 release / 审查 P0 零容忍 / PM 禁止 merge。
 
 详细步骤 + 失败回滚表见项目 `development_workflow.md`。
+
+## 2.5 轻量迭代（Workflow i(terate)）
+
+覆盖 bugfix + 小功能迭代，改动量 ≤200 行。不走标准 7 步，无 Daedalus/Themis/QA/worktree pool。
+
+```
+explore 定位（强制）→ PM 核验 → PM 出方案+用户确认
+  → General 分支实现+自验+push（iter）
+  → PM Windows 分支验证 → cherry-pick 回合 iter → 清理分支 → 收口
+```
+
+详见 `pm-workflow-iterate` skill。
 
 ## 3. 工具链闭环
 
@@ -74,4 +86,5 @@ General 一人定位→修复→验证→PR。≤30 行 cherry-pick 直推，>30
 - 不修改业务代码——业务代码走标准流水线
 - 不影响核心安全——工具链代码不触及业务核心逻辑
 - General 修复失败 ≤2 次重试——超过升级为正式 P<N>-T<M> 任务
+- 改动量 ≤30 行 → cherry-pick 直推 iter；>30 行 → PR
 - PM 禁止 merge——修复完成后 PM 汇报 PR，开发者合并

@@ -15,7 +15,7 @@
                                     │ session dispatch
                                     ▼
            ┌──────────────────────────────────────────────────┐
-           │              Pool（~/.worktrees/xidi-minimal）     │
+           │              Pool（~/.worktrees/{{project_name}}）     │
            │                                                  │
            │  wt_1              wt_2              wt_N         │
            │  ┌──────────┐     ┌──────────┐     ┌──────────┐  │
@@ -49,7 +49,7 @@
 ### 2.1 物理布局
 
 ```
-~/.worktrees/xidi-minimal/.state/
+~/.worktrees/{{project_name}}/.state/
 ├── .pool_rr_index            ← round-robin 指针（wt_1 起）
 ├── wt_1.state               ← worktree 状态 + agent session ID
 ├── wt_2.state
@@ -345,6 +345,31 @@ overview 和 `session show` 的 Context 列显示的是 session **最近一次�
 | `.pool_rr_index` 丢失 | 重置为 1（wt_1 起扫） |
 | pool lock 被占用 | `fail("another pool operation is running")` |
 
+## 9. sessions create 的 busy 保护与 force 语义
+
+### 9.1 busy / streaming 拒绝自动重建
+
+`sessions create` 遇到目标 agent 已有 **busy / streaming** session 时，**拒绝**自动 `delete_session(hard=True)` 重建——改为 `fail(...)` 报错，提示需显式 `--force`（commit `ec0c5d9`，BL-TOOLCHAIN-CREATE-BUSY-DELETE）。
+
+背景：历史上 busy session 会被静默 hard delete 重建，导致进行中的任务丢失（工作区虽未丢，但会话上下文被切断）。busy 意味着有未完成任务，自动删除 = 静默中断。
+
+### 9.2 --force 语义
+
+`--force` 的行为（BL-TOOLCHAIN-FORCE-SEMANTICS）：
+
+| 目标 session 状态 | `--force` 行为 |
+| --- | --- |
+| busy / streaming | **soft archive + unwatch 后重建**（保留历史，可恢复） |
+| idle / unknown | **no-op**（明确提示无需重建，不删除任何 OpenCode 历史） |
+
+不传 `--force` 时：busy/streaming → `fail(...)`；idle/unknown → 正常创建/复用。
+
+**关键**：`--force` 永远不会 hard delete OpenCode session 历史——busy 分支只做 soft archive（archive 旧 sid 不物理删除）。
+
+### 9.3 与 dispatch 决策树的关系
+
+`dispatch` 的 auto-create 路径（§3.4）不受 §9.1 限制——dispatch 在**同一任务流内**按决策树（missing / new-task / stale / 复用）处理 sid，此时 session 状态已由 sidecar `/status` 判定，`--require-no-busy` 模式下 busy 直接拒绝派发。`sessions create` 是**显式手动创建**入口，保护语义更严格。
+
 ## 10. auto-compact 设计
 
 ### 10.1 动机
@@ -362,7 +387,7 @@ busy→idle
   │
   ├─ fetch_session_context → > 300K?
   │   ├─ No → silent exit
-  │   └─ Yes → POST /summarize (deepseek-v4-flash-free, 60s 超时)
+  │   └─ Yes → POST /summarize ({{compact_model}}, 60s 超时)
   │         ├─ 失败 → [idle-notify:compact-failed] {error}, exit
   │         ├─ OK → POST ping prompt
   │         │   ├─ 失败 → [idle-notify:compact-failed] ping send failed, exit
@@ -380,7 +405,7 @@ busy→idle
 
 **ping-then-poll 而非直接读 context。** summarize 是 OpenCode 服务端异步操作，POST 返回 `true` 只表示请求已接受，上下文实际压缩在后续 LLM 调用时生效。compact 后发一条 ping prompt，等 busy→idle 再取 context，此时值才准确。
 
-**独立模型，不污染 session。** compact 用 `deepseek-v4-flash-free`（免费轻量），session 自身模型不变。summarize 端点和 prompt_async 端点是独立的——前者压缩消息历史，后者处理用户 prompt。
+**独立模型，不污染 session。** compact 用 `{{compact_model}}`（免费轻量），session 自身模型不变。summarize 端点和 prompt_async 端点是独立的——前者压缩消息历史，后者处理用户 prompt。
 
 **阈值 300K，不参数化。** Phase 1 硬编码足够——低于此值 compact 收益小（summarize 本身也有压缩损耗），高于此值收益明显。Phase 2+ 可按 agent 类型差异化（Momus 阈值低于 Daedalus）。
 
@@ -407,8 +432,8 @@ busy→idle
 
 | 文件 | 角色 |
 | --- | --- |
-| `scripts/session-worktree-mgr.py` | 完整实现（L1~3042） |
-| `scripts/session-status-server.mjs` | Sidecar 进程（Node，L1~648） |
+| `scripts/session-worktree-mgr.py` | 完整实现（L1~5613） |
+| `scripts/session-status-server.mjs` | Sidecar 进程（Node，L1~664） |
 | 命令操作参考 | 已内置 PM system prompt |
 | `docs/development_workflow.md` | 7 步流水线流程 |
 | `docs/operational_conventions.md` §OC5 | 约束级规则 |
