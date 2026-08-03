@@ -17,14 +17,14 @@ PM 专用 skill——项目状态查询。`project_tasks.md` 是任务状态索�
 
 1. Read `.pm/project_memory.md`（缺失 → [Workflow I](../pm-workflow-init/SKILL.md)）
 2. Read `docs/project_tasks.md`（缺失 → Workflow I）
-3. 跑 status.py 拿 9 项健康度检查（退出码 0=pass 1=fail 2=argerr）：
+3. 跑 status.py 拿 9 项健康度检查（退出码 0=pass 1=fail 2=argerr）；若 `worktree_clean` = warn，用 `git status --porcelain` 定位 main repo 的 dirty 文件：
 
    ```bash
    python .opencode/skills/pm-workflow-status/status.py [--json | --quiet] --pm-session-id <PM_CURRENT_SESSION_ID>
    ```
 
-4. 5a 健康度检查（status.py 跑） vs 5b 项目指标（PM 手工采）—— 职责分离：status.py 跑健康度断言；PM 手工采报告用派生数据（Active TASK 表行数 / Recently Completed 表行数 / Python 项目源码行数 / 测试文件数）。
-5. 识别 `project_tasks.md` 中的 [Current Phase] / [Active TASK 表] / [执行计划 ASCII 流图] / [Backlog / Later] / 漂移。Active TASK 是表格（列：任务|状态|优先级|类型|Spec|执行顺序），详细 Goal/Steps/Acceptance 在对应 `docs/task_specs/<task>.md`。
+4. 从 `docs/project_tasks.md` 手工采集项目指标：Active TASK 表行数 / Recently Completed 表行数 / Python 源码行数 / 测试文件数
+5. 识别漂移：对照 `project_memory.md`、`project_tasks.md`、status.py 结果三方数据，检查 Backlog 计数、Recently Completed 完整性、文档声称值与实测值的偏差
 6. 按 Response Format 输出报告
 
 ## 关键边界
@@ -32,7 +32,7 @@ PM 专用 skill——项目状态查询。`project_tasks.md` 是任务状态索�
 - **status.py 是唯一入口** — 不引入 fallback
 - **project_tasks.md 是任务状态索引**（表格 + 执行计划 ASCII 流图），**详细 spec（Goal/Steps/Acceptance/Notes）在 `docs/task_specs/`**——status 不需读 task_specs，Workflow N 负责创建/更新
 - **不读 plan 文档**（plan 是 [Workflow N](../pm-workflow-next/SKILL.md) 的输入）
-- **不主动修复漂移**（[OC1.4](../../pm/operational_conventions.md)）
+- **不主动修复漂移**（[OC1.4](../../../docs/operational_conventions.md)）
 - **不要和 Workflow N 混淆**（本工作流无建议、无选项、无下一步计划）
 - **不要输出 `# <N>条路` 段**
 
@@ -42,7 +42,7 @@ PM 专用 skill——项目状态查询。`project_tasks.md` 是任务状态索�
 
 | `name` | V1 早期期望 | 状态映射 |
 |--------|-------------|----------|
-| `worktree_clean` | 0 dirty | pass=0 / warn=≥1 |
+| `worktree_clean` | 0 dirty | pass=0 / warn=≥1 \| 针对 main repo，`git status --porcelain` 定位 |
 | `branch` | `main` | pass=main / warn=其他 |
 | `untracked_files` | 0 | pass=0 / warn=≥1 |
 | `python_source` | > 0（V1 早期可 0）| pass=>0 / warn=0 |

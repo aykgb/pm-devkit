@@ -9,6 +9,7 @@
 """
 
 import argparse
+import os
 import re
 import sys
 from datetime import datetime
@@ -115,11 +116,16 @@ def _slug_from_task(task_id: str) -> str:
     return task_id.lower().replace(" ", "-").replace("_", "-")
 
 
-def _write_devlog(devlog_path: Path, task_id: str, slug: str | None, summary: str, pr: str | None) -> None:
-    """Insert a new row at the top of development_log.md table."""
+def _write_devlog(devlog_path: Path, task_id: str, slug: str | None, summary: str, pr: str | None) -> bool:
+    """Insert a new row at the top of development_log.md table.
+
+    Returns True on success, False on failure (file missing, header not found).
+    Auto-inserts a missing |---|---| separator to keep the table valid.
+    Uses atomic write (tmp + os.replace) to avoid partial-file corruption.
+    """
     if not devlog_path.exists():
-        print(f"   ⚠ devlog 文件不存在，跳过: {devlog_path}", file=sys.stderr)
-        return
+        print(f"   错误：devlog 文件不存在: {devlog_path}", file=sys.stderr)
+        return False
 
     with open(devlog_path, encoding="utf-8") as f:
         lines = f.readlines()
@@ -130,21 +136,36 @@ def _write_devlog(devlog_path: Path, task_id: str, slug: str | None, summary: st
     commit_text = f"[#{pr}](https://github.com/aykgb/xidi-minimal/pull/{pr})" if pr else "待提交"
     new_row = f"| {date} | {final_slug} | {safe_summary} | {commit_text} |\n"
 
-    # Find the first table separator line (|---|...|)
+    # Find the header line (contains both "Date" and "Slug")
+    header_idx = None
     for i, line in enumerate(lines):
         stripped = line.strip()
-        if stripped.startswith("|") and "---" in stripped:
-            if i > 0 and "Date" in lines[i - 1] and "Slug" in lines[i - 1]:
-                lines.insert(i + 1, new_row)
-                break
-    else:
-        print("   ⚠ 找不到 devlog 表头，跳过", file=sys.stderr)
-        return
+        if stripped.startswith("|") and "Date" in stripped and "Slug" in stripped:
+            header_idx = i
+            break
+    if header_idx is None:
+        print("   错误：devlog 找不到表头行（| Date | Slug | ... |）", file=sys.stderr)
+        return False
 
-    with open(devlog_path, "w", encoding="utf-8") as f:
+    # Ensure separator line exists immediately after the header; auto-insert if missing
+    if header_idx + 1 >= len(lines) or "---" not in lines[header_idx + 1]:
+        header_line = lines[header_idx].rstrip("\n")
+        n_cols = max(header_line.count("|") - 1, 1)
+        sep_line = "| " + " | ".join(["---"] * n_cols) + " |\n"
+        lines.insert(header_idx + 1, sep_line)
+        print(f"   ⚠ devlog 缺 separator，已自动补充（{n_cols} 列）", file=sys.stderr)
+
+    sep_idx = header_idx + 1
+    lines.insert(sep_idx + 1, new_row)
+
+    # Atomic write: write to .tmp first, then os.replace
+    tmp_path = devlog_path.with_name(devlog_path.name + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
         f.writelines(lines)
+    os.replace(tmp_path, devlog_path)
 
     print(f"   devlog 已更新: {date} | {final_slug}")
+    return True
 
 
 def _update_phase_status(lines: list[str], tools: int | None, tests: int | None) -> None:
@@ -234,7 +255,8 @@ def main() -> None:
 
     # 9. Sync devlog if requested
     if args.devlog:
-        _write_devlog(DEFAULT_DEVLOG_FILE, args.task, args.slug, args.summary, args.pr)
+        if not _write_devlog(DEFAULT_DEVLOG_FILE, args.task, args.slug, args.summary, args.pr):
+            sys.exit(1)
 
     with open(args.file, "w", encoding="utf-8") as f:
         f.writelines(lines)

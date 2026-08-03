@@ -34,14 +34,12 @@ PM 专用 skill——安排下一步任务。`project_tasks.md` 是任务状态�
    - **Active TASK 非空**：路径选项为「继续推进当前 Batch」「先清扫 Backlog」「其他」
    - **Active TASK 为空**：扫描 Backlog + `implementation_plan.md` 下一 Phase 目标，产出选项。仅一条可行路径 → 直接推荐。
 
-7. 用户选定方向后 → 执行 **Spec 拆解**，详见 [`.pm/project_memory.md`](../../../.pm/project_memory.md) §Spec 拆解流程。
+7. 用户选定方向后 → 加载 skill **`pm-workflow-spec-breakdown`** 执行 spec 拆解 + Batch 编组 + Momus 审视。
 
    核心决策树：
    - 已有 spec 文件 → 直接更新 `project_tasks.md` Active TASK 表 + 执行计划
    - Active TASK 为空 + Backlog 有高优项 → 移到 Active TASK，按需补 spec
-   - 需新造 Phase 任务 → General 拆解 → PM 编组 Batch → 更新 `project_tasks.md`
-
-8. **Momus 审视**：正式 Phase 任务（`P<N>-T<N>`）的 spec 就位后触发，详见 §Spec 拆解流程 ⑥-⑦。非 Phase 任务（`BL-*`）跳过。
+   - 需新造 Phase 任务 → skill 自动路由（≤2 PM 直接写 / ≥3 派 General）
 
 9. 提示：「Batch 就绪。说『开工』我出执行方案。」
 
@@ -49,4 +47,4 @@ PM 专用 skill——安排下一步任务。`project_tasks.md` 是任务状态�
 
 - 步骤 6 路径选项在细化 spec 之前——用户选方向后再动工
 - 委派只给任务 ID（OC3.2）
-- Spec 拆解 / Momus fix loop / Batch 设计的详细规则不在本 skill —— 见 `.pm/project_memory.md`
+- Spec 拆解 / Momus fix loop / Batch 设计的详细规则由 `pm-workflow-spec-breakdown` skill 覆盖

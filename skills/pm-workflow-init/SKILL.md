@@ -1,11 +1,11 @@
 ---
 name: pm-workflow-init
-description: PM 专用：Workflow I(nit) 项目初始化。优先使用 `scripts/pm-bootstrap.py`，降级为手工创建。
+description: PM 专用：Workflow I(nit) 项目初始化。优先使用 `.pm/devkit/scripts/pm-bootstrap.py`，降级为手工创建。
 ---
 
 # pm-workflow-init
 
-PM 专用 skill——项目首次初始化。对齐 `.pm/devkit/pm_devkit_design.md` §0.1 "最小文件集合"。
+PM 专用 skill——项目首次初始化。基于 `.pm/devkit/pm_devkit_design.md` 定义的最小文件集合。
 
 ## 触发规则
 
@@ -36,10 +36,8 @@ PM 专用 skill——项目首次初始化。对齐 `.pm/devkit/pm_devkit_design
 
 ### 2. 运行 bootstrap 脚本
 
-> **路径说明（per H2 修复）**：bootstrap 实际从**项目根 `scripts/`** 跑（不是 `.pm/devkit/scripts/`，submodule 是 devkit 源码、scripts 是部署后位置）。先 cd 项目根目录。
-
 ```bash
-python scripts/pm-bootstrap.py --from docs/
+python .pm/devkit/scripts/pm-bootstrap.py --from docs/
 ```
 
 脚本自动：
@@ -67,10 +65,12 @@ python scripts/pm-bootstrap.py --from docs/
 ```
 .pm/
   project_memory.md          ✅/❌
-  operational_conventions.md ✅/❌
   persona.md                 ✅/❌
   user_profile.md            ✅/❌
   user_behavior.md           ✅/❌
+
+docs/
+  operational_conventions.md ✅/❌
 
 .opencode/agents/
   project-manager.md         ✅/❌
@@ -96,12 +96,12 @@ docs/
 | 文件 | 来源 | 创建方式 |
 |------|------|---------|
 | `.pm/project_memory.md` | `.pm/devkit/templates/pm/project_memory.md` | PM 直接写（填入项目名 + 当前 Phase） |
-| `docs/operational_conventions.md` | `.pm/devkit/templates/pm/operational_conventions.md` | PM 直接写 |
 | `.pm/persona.md` | 模板项目 `persona.md` | PM 直接写（含管理模式 + 闲聊模式） |
 | `.pm/user_profile.md` | 空模板（头部 + 分类占位） | PM 直接写 |
 | `.pm/user_behavior.md` | 空模板（统计初始化为 0） | PM 直接写 |
 | `.pm/chats/INDEX.md` | 空索引表 | PM 直接写 |
 | `.pm/` `reflections/` 目录 | — | `mkdir -p` |
+| `docs/operational_conventions.md` | `.pm/devkit/templates/pm/operational_conventions.md` | PM 直接写 |
 
 `persona.md` 最小内容：
 
@@ -154,11 +154,11 @@ docs/
 
 | 文件 | 说明 |
 |------|------|
-| `.pm/project_memory.md` | Agent 派发 · Spec 拆解 · Batch 设计 |
-| `docs/operational_conventions.md` | OC0-OC5 操作约定 |
+| `.pm/project_memory.md` | Agent 系统 · 工作流（拆解/流水线/收口） · 工具操作经验 |
 | `.pm/persona.md` | PM 双模式语气定义 |
 | `.pm/user_profile.md` | 用户画像（空） |
 | `.pm/user_behavior.md` | 行为日志（空） |
+| `docs/operational_conventions.md` | OC0-OC5 操作约定 |
 | `docs/project_tasks.md` | Phase N — Active TASK（第一批） |
 | `docs/development_log.md` | 开发历史（空表） |
 

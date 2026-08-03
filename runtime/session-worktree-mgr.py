@@ -74,6 +74,7 @@ def run(
     check: bool = True,
     capture: bool = False,
     env_extra: dict[str, str] | None = None,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     merged_env = os.environ.copy()
     if env_extra:
@@ -85,6 +86,7 @@ def run(
         text=True,
         capture_output=capture,
         check=check,
+        timeout=timeout,
     )
 
 
@@ -93,8 +95,8 @@ def require_cmd(name: str) -> None:
         fail(f"command not found: {name}")
 
 
-def git(cwd: Path, *args: str, capture: bool = False, check: bool = True) -> subprocess.CompletedProcess[str]:
-    return run(["git", "-C", str(cwd), *args], capture=capture, check=check)
+def git(cwd: Path, *args: str, capture: bool = False, check: bool = True, timeout: float | None = None) -> subprocess.CompletedProcess[str]:
+    return run(["git", "-C", str(cwd), *args], capture=capture, check=check, timeout=timeout)
 
 
 def repo_root(cwd: Path | None = None) -> Path:
@@ -209,6 +211,8 @@ def http_json(
         fail(f"{method} {url} timed out after {effective_timeout}s.\nFor directory=worktree, run pool repair/init to prewarm the worktree.")
     except urllib.error.URLError as exc:
         fail(f"{method} {url} failed: {exc}")
+    except Exception as exc:
+        fail(f"{method} {url} failed: {exc.__class__.__name__}: {exc}")
     if status not in expected:
         text = payload.decode("utf-8", errors="replace")
         fail(f"{method} {url} failed: HTTP {status}\n{text}")
@@ -268,11 +272,10 @@ def _pool_lock_break_stale(lock_dir: Path) -> bool:
         pid = int(pid_text)
         try:
             os.kill(pid, 0)
-            # PID is alive — do not break.
+            return False
         except ProcessLookupError:
             stale = True
         except PermissionError:
-            # We can't tell from this process; fall through to mtime check.
             pass
     if (time.time() - mtime) > _POOL_LOCK_STALE_SECONDS:
         stale = True
@@ -413,16 +416,49 @@ def _do_atomic_state_write(tmp_path: Path, path: Path, payload: str) -> None:
         raise
 
 
+def _update_state_file(path: Path, patch: dict[str, str]) -> dict[str, str]:
+    """Read-merge-write under flock, preventing lost-update race on state files.
+
+    The earlier `_write_state_file` only serialized the write half of the
+    read-modify-write, so two concurrent callers could both read the same
+    initial state, both merge their own patches, and the second ``os.replace``
+    would clobber the first writer's patch.  This helper takes flock over the
+    full read → merge → write critical section.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(f".{path.name}.lock")
+    tmp_path = path.with_name(f".{path.name}.tmp")
+
+    def _do() -> dict[str, str]:
+        data = _read_state_file(path)
+        data.update(patch)
+        data["updated_at"] = now_utc()
+        payload = "".join(f"{k}={v}\n" for k, v in data.items())
+        tmp_path.write_text(payload, encoding="utf-8")
+        try:
+            os.replace(tmp_path, path)
+        except OSError:
+            with contextlib.suppress(OSError):
+                tmp_path.unlink()
+            raise
+        return data
+
+    if fcntl is not None:
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            return _do()
+        finally:
+            os.close(lock_fd)
+    return _do()
+
+
 def write_state(config: Config, wt_id: str, values: dict[str, str]) -> None:
     _write_state_file(state_file(config, wt_id), values)
 
 
 def update_state(config: Config, wt_id: str, patch: dict[str, str]) -> dict[str, str]:
-    state = read_state(config, wt_id)
-    state.update(patch)
-    state["updated_at"] = now_utc()
-    write_state(config, wt_id, state)
-    return state
+    return _update_state_file(state_file(config, wt_id), patch)
 
 
 def _tombstoned_sids(state: dict[str, str]) -> set[str]:
@@ -522,6 +558,21 @@ def resolve_wt_id_or_path(config: Config, value: str) -> tuple[str, Path]:
     wt_id = path.name
     validate_wt_id(wt_id)
     return wt_id, path
+
+
+def resolve_pool_wt_target(config: Config, value: str) -> tuple[str, Path]:
+    """Resolve a pool op target, rejecting the main repo.
+
+    ``resolve_wt_id_or_path`` accepts ``config.repo`` and returns
+    ``("xidi-minimal", repo)`` so that ``sessions list/delete`` can target
+    the main worktree.  Pool ops (prepare / release / dispatch) must NEVER
+    touch the main repo: doing so would reset / dirty-check / branch-checkout
+    the user's working tree.  This wrapper enforces that boundary.
+    """
+    wt_id, wt_path = resolve_wt_id_or_path(config, value)
+    if wt_id == "xidi-minimal" or wt_path == config.repo:
+        fail(f"refusing to run pool op on main repo ({wt_path}). Pool ops target wt_N worktrees only — use `sessions list --main` or `sessions delete --main` for main-repo session management.")
+    return wt_id, wt_path
 
 
 def is_git_worktree(path: Path) -> bool:
@@ -648,7 +699,37 @@ def opencode_config(config: Config) -> dict[str, Any]:
     return cast(dict[str, Any], json.loads(path.read_text(encoding="utf-8")))
 
 
-def opencode_model(config: Config, agent: str) -> tuple[str, str, str | None]:
+def parse_model_override(override: str) -> tuple[str, str, str | None]:
+    """Parse the manager's ``providerID/modelID[:variant]`` notation."""
+    # The variant is only recognized when the lone ":" sits to the right of
+    # the "/" (i.e. it qualifies the model id, not the provider id).
+    model_str = override
+    variant: str | None = None
+    if ":" in model_str:
+        head, _, tail = model_str.partition(":")
+        if "/" in head and ":" not in tail:
+            model_str, variant = head, tail
+    if "/" not in model_str:
+        fail(f"--model override must be 'providerID/modelID[:variant]', got: {override!r}")
+    provider_id, model_id = model_str.split("/", 1)
+    if not provider_id or not model_id:
+        fail(f"--model override must be 'providerID/modelID[:variant]', got: {override!r}")
+    return provider_id, model_id, variant
+
+
+def model_label(provider_id: str, model_id: str, variant: str | None = None) -> str:
+    return f"{provider_id}/{model_id}" + (f":{variant}" if variant else "")
+
+
+def is_session_pointer_key(key: str) -> bool:
+    """Return whether a state key owns a session, excluding model metadata."""
+    return key.endswith("_session_id") and not key.endswith("_model_session_id")
+
+
+def opencode_model(config: Config, agent: str, *, override: str | None = None) -> tuple[str, str, str | None]:
+    if override:
+        # CLI override wins over agent config.
+        return parse_model_override(override)
     data = opencode_config(config)
     agent_config = data.get("agent", {}).get(agent, {})
     variant = None
@@ -667,6 +748,9 @@ def opencode_model(config: Config, agent: str) -> tuple[str, str, str | None]:
 
 
 def session_create_model(provider_id: str, model_id: str, variant: str | None) -> dict[str, str]:
+    # POST /session uses the persisted Session model schema: ``id`` is the
+    # model id.  prompt_async uses a different request schema and therefore
+    # needs ``modelID`` (see prompt_model below).  Do not share these dicts.
     result = {"id": model_id, "providerID": provider_id}
     if variant:
         result["variant"] = variant
@@ -675,6 +759,81 @@ def session_create_model(provider_id: str, model_id: str, variant: str | None) -
 
 def prompt_model(provider_id: str, model_id: str) -> dict[str, str]:
     return {"providerID": provider_id, "modelID": model_id}
+
+
+def session_bound_model(session: dict[str, Any] | None) -> tuple[str, str, str | None] | None:
+    """Read a model from an OpenCode session response.
+
+    OpenCode session responses store the model id as ``model.id`` while some
+    API-compatible servers expose ``model.modelID``.  Accept both response
+    shapes, but always return the manager's canonical tuple so dispatch can
+    build the prompt request correctly.
+    """
+    if not isinstance(session, dict):
+        return None
+    raw = session.get("model")
+    if not isinstance(raw, dict):
+        return None
+    provider_id = raw.get("providerID")
+    model_id = raw.get("id") or raw.get("modelID")
+    if not isinstance(provider_id, str) or not isinstance(model_id, str) or not provider_id or not model_id:
+        return None
+    variant = raw.get("variant")
+    if not isinstance(variant, str) or not variant or variant == "default":
+        variant = None
+    return provider_id, model_id, variant
+
+
+def stored_model_override(state: dict[str, str] | None, agent: str, session_id: str) -> tuple[str, str, str | None] | None:
+    """Return a preselected model only while it belongs to this session.
+
+    Older OpenCode servers accept the extra ``model`` field on create but do
+    not persist it.  ``sessions create --model`` therefore pins the requested
+    model in manager state until the first prompt binds it in OpenCode.
+    """
+    if not state or state.get(f"{agent}_model_session_id") != session_id:
+        return None
+    raw = state.get(f"{agent}_model_override", "")
+    if not raw:
+        return None
+    try:
+        return parse_model_override(raw)
+    except SystemExit:
+        # A manually edited state file must not make an otherwise valid
+        # session undispatchable.  The normal agent config remains a fallback.
+        eprint(f"warning: ignoring invalid stored model override for {agent} {session_id}: {raw!r}")
+        return None
+
+
+def dispatch_model(
+    config: Config,
+    agent: str,
+    session: dict[str, Any] | None,
+    *,
+    override: str | None = None,
+    state: dict[str, str] | None = None,
+) -> tuple[str, str, str | None]:
+    """Choose the model for a prompt.
+
+    Explicit ``--model`` wins.  A manager-side preselection made by
+    ``sessions create --model`` remains authoritative until the first prompt
+    for compatibility with servers that ignore the model on ``POST /session``.
+    Otherwise a model already bound to the session wins, and only then do we
+    consult the agent definition; this prevents an agent config change from
+    silently replacing a session's model.
+    """
+    if override:
+        return opencode_model(config, agent, override=override)
+    bound = session_bound_model(session)
+    preselected = stored_model_override(state, agent, str((session or {}).get("id") or ""))
+    if preselected:
+        # A preselection represents an explicit choice made at session create.
+        # It wins over a mismatching server response only until the first
+        # dispatch clears it; matching responses are equivalent.
+        return preselected
+    if bound:
+        return bound
+    return opencode_model(config, agent)
 
 
 def sessions(config: Config, *, directory: Path | None = None, search: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
@@ -781,7 +940,7 @@ def delete_session(config: Config, session_id: str, *, hard: bool = False) -> No
 
 STALE_SESSION_MS_DEFAULT = 24 * 60 * 60 * 1000  # 1 day
 STALE_DISPATCH_MS = 10 * 60 * 1000  # 10 min — auto-recover stuck dispatch sessions
-MAX_MAIN_SESSION_CONTEXT = 350_000  # auto-compact main agent session when context exceeds this (>1d → rebuild)
+MAX_MAIN_SESSION_CONTEXT = 400_000  # auto-compact main agent session when context exceeds this (>1d → rebuild)
 
 # Default recent window for `cmd_overview` and `rewatch_all_sessions`.
 # Sessions whose `time.updated` is older than this are filtered out unless
@@ -806,16 +965,35 @@ def is_session_stale(session: dict[str, Any], max_age_ms: int = STALE_SESSION_MS
     return (int(time.time() * 1000) - updated) > max_age_ms
 
 
+_KNOWN_AGENT_NAMES: dict[str, str] = {
+    "pm": "PM",
+    "momus": "Momus",
+    "clio": "Clio",
+    "daedalus": "Daedalus",
+    "morpheus": "Morpheus",
+    "themis": "Themis",
+    "qa": "QA",
+    "janitor": "Janitor",
+    "websearch": "WebSearch",
+    "explore": "Explore",
+    "general": "General",
+}
+"""Canonical agent name mapping (lowercase → proper case)."""
+
+
 def normalize_agent_label(agent: object) -> str:
     """Return a stable display/grouping label for agent names.
 
-    OpenCode/plugin sources may report the PM agent as either ``PM`` or
-    ``pm``.  Overview and sidecar grouping must treat both as the same agent;
-    other agent names preserve their original spelling.
+    OpenCode/plugin sources may report agent names in any case.
+    All known agents are normalized to canonical proper case;
+    unknown names are capitalized on first letter as fallback.
     """
     if not isinstance(agent, str) or not agent:
         return "__unknown__"
-    return "PM" if agent.lower() == "pm" else agent
+    key = agent.lower()
+    if key in _KNOWN_AGENT_NAMES:
+        return _KNOWN_AGENT_NAMES[key]
+    return agent[0].upper() + agent[1:] if len(agent) > 1 else agent.upper()
 
 
 def _is_pm_agent(agent: object) -> bool:
@@ -924,13 +1102,15 @@ def cleanup_stale_sessions(
     # invocations that the state file is still tracking).
     pinned_sids: dict[str, str] = {}  # sid -> "<agent>_session_id" key
     for key in list(state.keys()):
-        if not key.endswith("_session_id"):
+        if not is_session_pointer_key(key):
             continue
         agent = key[: -len("_session_id")]
         sid = state[key]
         if not sid:
             state.pop(key, None)
             state.pop(f"{agent}_session_title", None)
+            state.pop(f"{agent}_model_override", None)
+            state.pop(f"{agent}_model_session_id", None)
             continue
         pinned_sids[sid] = key
     tombstoned = _tombstoned_sids(state)
@@ -987,6 +1167,8 @@ def cleanup_stale_sessions(
                 pass
             state.pop(key, None)
             state.pop(f"{agent}_session_title", None)
+            state.pop(f"{agent}_model_override", None)
+            state.pop(f"{agent}_model_session_id", None)
             cleaned.append((agent, sid))
     # Prune tombstoned sids that are no longer present in OpenCode, so the
     # tombstone field does not grow unbounded across many ``sessions delete``
@@ -1004,9 +1186,9 @@ def cleanup_stale_sessions(
     return cleaned
 
 
-def create_session(config: Config, wt_id: str, wt_path: Path, agent: str) -> dict[str, Any]:
+def create_session(config: Config, wt_id: str, wt_path: Path, agent: str, *, model_override: str | None = None) -> dict[str, Any]:
     title = f"{wt_id}-{agent}"
-    provider_id, model_id, variant = opencode_model(config, agent)
+    provider_id, model_id, variant = opencode_model(config, agent, override=model_override)
     body = {
         "title": title,
         "agent": agent,
@@ -1022,6 +1204,16 @@ def create_session(config: Config, wt_id: str, wt_path: Path, agent: str) -> dic
     data = http_json("POST", f"{config.op_server}/session?{query}", body, expected=(200, 201))
     if not isinstance(data, dict) or not data.get("id"):
         fail(f"create session failed: response missing id for {title}")
+    if model_override:
+        requested = (provider_id, model_id, variant)
+        bound = session_bound_model(cast(dict[str, Any], data))
+        if bound != requested:
+            # Some OpenCode releases silently strip ``model`` from the
+            # create payload even though the prompt endpoint supports model
+            # selection.  The caller persists the requested model alongside
+            # this session so the first dispatch still pins it explicitly.
+            actual = model_label(*bound) if bound else "(unset)"
+            eprint(f"warning: OpenCode did not bind --model {model_label(*requested)} when creating {data['id']} (reported {actual}); first dispatch will pin it")
     return cast(dict[str, Any], data)
 
 
@@ -1035,6 +1227,7 @@ def ensure_session(
     recreate_stale: bool = False,
     recreate_existing: bool = False,
     max_age_ms: int = STALE_SESSION_MS_DEFAULT,
+    model_override: str | None = None,
 ) -> dict[str, Any]:
     """Return a usable session for ``(wt_id, agent)``.
 
@@ -1099,7 +1292,7 @@ def ensure_session(
             eprint(f"stale state session id archived: {agent} {state_sid}")
             if not recreate_missing:
                 fail(f"missing session for {title}; run pool repair {wt_id}")
-            return create_session(config, wt_id, wt_path, agent)
+            return create_session(config, wt_id, wt_path, agent, model_override=model_override)
     item = find_session_by_title(config, title, wt_path)
     if item and str(item.get("id", "")) in tombstoned:
         # Soft-deleted via ``sessions delete`` (no ``--hard``): the title
@@ -1119,22 +1312,63 @@ def ensure_session(
             return item
     if not recreate_missing:
         fail(f"missing session for {title}; run pool repair {wt_id}")
-    return create_session(config, wt_id, wt_path, agent)
+    return create_session(config, wt_id, wt_path, agent, model_override=model_override)
 
 
-def persist_session(config: Config, wt_id: str, agent: str, session: dict[str, Any]) -> None:
+def persist_session(
+    config: Config,
+    wt_id: str,
+    agent: str,
+    session: dict[str, Any],
+    *,
+    model_override: str | None = None,
+) -> None:
     sid = str(session.get("id") or "")
     if not sid:
         fail(f"session missing id for {wt_id}-{agent}")
+    patch = {
+        f"{agent}_session_id": sid,
+        f"{agent}_session_title": str(session.get("title") or f"{wt_id}-{agent}"),
+        f"{agent}_model_override": "",
+        f"{agent}_model_session_id": "",
+    }
+    if model_override:
+        provider_id, model_id, variant = opencode_model(config, agent, override=model_override)
+        patch[f"{agent}_model_override"] = model_label(provider_id, model_id, variant)
+        patch[f"{agent}_model_session_id"] = sid
+    update_state(
+        config,
+        wt_id,
+        patch,
+    )
+    watch_session(config, sid)
+
+
+def clear_stored_model_override(config: Config, wt_id: str, agent: str, session_id: str) -> None:
+    """Drop a create-time model pin after its first prompt is accepted."""
+    if wt_id == "main":
+        state = read_main_state(config)
+        if state.get(f"{agent}_model_session_id") != session_id:
+            return
+        update_main_state(
+            config,
+            {
+                f"{agent}_model_override": "",
+                f"{agent}_model_session_id": "",
+            },
+        )
+        return
+    state = read_state(config, wt_id)
+    if state.get(f"{agent}_model_session_id") != session_id:
+        return
     update_state(
         config,
         wt_id,
         {
-            f"{agent}_session_id": sid,
-            f"{agent}_session_title": str(session.get("title") or f"{wt_id}-{agent}"),
+            f"{agent}_model_override": "",
+            f"{agent}_model_session_id": "",
         },
     )
-    watch_session(config, sid)
 
 
 # ---------------- node_modules copy ----------------
@@ -1265,6 +1499,27 @@ def _get_session_status(config: Config, session_id: str) -> str:
     return str(raw) if isinstance(raw, str) else "unknown"
 
 
+def _check_no_active_sessions_on_wt(config: Config, wt_id: str) -> None:
+    """Refuse reset if any session on this worktree is busy/streaming.
+
+    Prevents accidentally destroying uncommitted agent work via
+    ``pool repair --reset`` while a session is actively running.
+    Query strings ``{agent}_session_id`` from the worktree state file
+    and check sidecar /status for each.
+    """
+    state = read_state(config, wt_id)
+    active: list[str] = []
+    for key, sid in state.items():
+        if not is_session_pointer_key(key) or not sid:
+            continue
+        status = _get_session_status(config, sid)
+        if status in ("busy", "streaming"):
+            agent = key.replace("_session_id", "")
+            active.append(f"{agent}({status})")
+    if active:
+        fail(f"refusing --reset on {wt_id}: {len(active)} active session(s) ({', '.join(active)})\n  Use 'overview --wt {wt_id}' to inspect, then retry when sessions are idle.")
+
+
 def wait_until(fn: Callable[[], bool], timeout: int = 20) -> bool:
     for _ in range(timeout):
         if fn():
@@ -1335,7 +1590,7 @@ def rewatch_all_sessions(config: Config) -> None:
         state = read_state(config, wt_id)
         tombstoned = _tombstoned_sids(state)
         for key, sid in state.items():
-            if not key.endswith("_session_id") or not isinstance(sid, str) or not sid:
+            if not is_session_pointer_key(key) or not isinstance(sid, str) or not sid:
                 continue
             if sid in tombstoned:
                 # Soft-deleted via ``sessions delete`` (no ``--hard``): skip
@@ -1355,7 +1610,7 @@ def rewatch_all_sessions(config: Config) -> None:
         if pm_sid and pm_sid not in main_tombstoned:
             _ingest_sid(pm_sid, "xidi-minimal", pm_session_id=pm_sid)
         for key, sid in main_state.items():
-            if key.endswith("_session_id") and sid and sid not in main_tombstoned:
+            if is_session_pointer_key(key) and sid and sid not in main_tombstoned:
                 _ingest_sid(sid, "xidi-minimal", pm_session_id=pm_sid)
     filtered = _apply_recent_filter(
         candidates,
@@ -1425,7 +1680,6 @@ def cmd_opencode_serve_service(args: argparse.Namespace, config: Config) -> None
             _write_pid_file(op_pid_file, proc.pid)
             if not wait_until(lambda: op_healthy(config)):
                 fail(f"OpenCode Server did not become healthy; log={log_file(config, 'opencode-server')}")
-            eprint(f"OpenCode Server: started pid={proc.pid}")
             eprint(f"OpenCode Server: started pid={proc.pid}")
         else:
             eprint("OpenCode Server: already healthy")
@@ -1543,6 +1797,7 @@ def repair_one(
     validate_wt_id(wt_id)
     wt_path = create_or_reuse_worktree(config, wt_id)
     if reset:
+        _check_no_active_sessions_on_wt(config, wt_id)
         reset_to_base(wt_path, config.base_ref)
     copy_opencode_node_modules(config, wt_path, force=force_copy)
     state = read_state(config, wt_id)
@@ -1574,11 +1829,10 @@ def cmd_pool_init(args: argparse.Namespace, config: Config) -> None:
             wt_id = wt_id_for_index(i)
             eprint(f"== pool init {wt_id} ==")
             # pool init no longer pre-creates agent sessions — they show up
-            # as ``unknown`` in sidecar /status until first dispatch, and a
-            # freshly initialized wt often ends up with 2-3 agents that
-            # never see a prompt. Sessions are created lazily on the first
-            # ``dispatch`` (see cmd_dispatch auto-create fallback) or
-            # eagerly via ``pool prepare`` / ``pool repair``.
+            # as absent from sidecar /status until first dispatch, and a
+            # freshly initialized wt no longer accumulates agents that never
+            # see a prompt. Sessions are created lazily on first
+            # ``dispatch`` (see cmd_dispatch auto-create fallback).
             results.append(
                 repair_one(
                     config,
@@ -1763,17 +2017,19 @@ def cmd_prepare(args: argparse.Namespace, config: Config) -> None:
 
 def _hard_constraints() -> str:
     return """---
-⚠️ 硬约束：
+⚠️ HARD CONSTRAINTS:
 
-- 按 workflow 完成任务——不跳过 Checking / Testing / PR 步骤
-- 修改前先读目标文件和关联文件——禁止对路径/签名/契约做假设
-- 遇到阻塞不绕行——立即报告 blocker 与原因，禁止用 workaround/暂不确定/能跑就行为托词
+- 严格按 workflow 完成任务 - 不跳、不省略、不提前结束
+- 禁止发起 subagent 任务
+- 禁止访问（读或写）工作目录外的文件
+- 任何阻塞点或需要进一步决策的问题都应暂停任务并报告状态
+- 最后一条消息按报告格式（如有）输出，没有规定报告格式则做总结性陈述
 """
 
 
 def render_prompt(wt_dir: Path, task: str, *, config: Config) -> str:
-    is_main = wt_dir == config.repo
-    header = f"<!-- wt: {wt_dir.name} -->" if not is_main else "<!-- wt: main -->"
+    label = "main" if wt_dir == config.repo else wt_dir.name
+    header = f"<!-- {label}: {wt_dir} -->"
     return f"""{header}
 
 {task}
@@ -1802,6 +2058,10 @@ def cmd_dispatch(args: argparse.Namespace, config: Config) -> None:
                 f'  {PROG} dispatch --session ses_xxx --task "..." --yes\n'
                 f'  {PROG} session dispatch ses_xxx --task "..." --yes'
             )
+    # Validate --model override early so a bad value exits before any
+    # destructive action (delete_session + create_session pair below).
+    if getattr(args, "model", None):
+        opencode_model(config, args.agent or "_validate", override=args.model)
     if args.session:
         # Direct session dispatch — bypass wt_id/state lookup.
         # Used for main-repo agents (Janitor/General) that have persistent
@@ -1814,7 +2074,7 @@ def cmd_dispatch(args: argparse.Namespace, config: Config) -> None:
         main_state = read_main_state(config)
         owned_key = None
         for key, val in main_state.items():
-            if key.endswith("_session_id") and val == sid:
+            if is_session_pointer_key(key) and val == sid:
                 owned_key = key[: -len("_session_id")]
                 break
         if not owned_key:
@@ -1828,6 +2088,10 @@ def cmd_dispatch(args: argparse.Namespace, config: Config) -> None:
         # metadata.  main.state ownership is the most authoritative since
         # ``sessions create --agent <X>`` pins the agent name explicitly.
         agent = args.agent or owned_key or str(ses.get("metadata", {}).get("agent") or ses.get("agent") or "")
+        if agent:
+            agent = normalize_agent_label(agent)
+            if args.agent:
+                args.agent = agent
         if not agent:
             fail("--agent required when --session metadata has no agent")
         if not wt_path.is_dir():
@@ -1844,10 +2108,10 @@ def cmd_dispatch(args: argparse.Namespace, config: Config) -> None:
             else:
                 eprint(f"session {sid} created >1d ago; auto-rebuilding ({agent})...")
                 delete_session(config, sid, hard=True)
-                new_ses = create_session(config, "main", wt_path, agent)
+                new_ses = create_session(config, "main", wt_path, agent, model_override=getattr(args, "model", None))
                 sid = new_ses["id"]
                 ses = new_ses
-                persist_main_session(config, agent, new_ses)
+                persist_main_session(config, agent, new_ses, model_override=getattr(args, "model", None))
                 # Refresh local main_state so the agent-missing guard below
                 # sees the freshly-persisted pointer; otherwise a dispatch
                 # where args.agent=X and the sid was owned by agent Y would
@@ -1874,19 +2138,21 @@ def cmd_dispatch(args: argparse.Namespace, config: Config) -> None:
                 )
                 return
             eprint(f"agent {args.agent} has no entry in current PM's main.state; auto-creating...")
-            new_ses = create_session(config, "main", config.repo, args.agent)
+            new_ses = create_session(config, "main", config.repo, args.agent, model_override=getattr(args, "model", None))
             sid = new_ses["id"]
             ses = new_ses
-            persist_main_session(config, args.agent, new_ses)
-            agent = args.agent
-            wt_path = Path(config.repo).resolve()
-            wt_id = "main"
+            persist_main_session(config, args.agent, new_ses, model_override=getattr(args, "model", None))
+            main_state = read_main_state(config)
+        if args.agent:
+            agent = normalize_agent_label(args.agent)
+        wt_path = Path(config.repo).resolve()
+        wt_id = "main"
     else:
         wt_id = args.wt_id
         validate_wt_id(wt_id)
         state = read_state(config, wt_id)
         wt_path = Path(state.get("wt_path") or path_for_wt(config, wt_id)).resolve()
-        agent = args.agent
+        agent = normalize_agent_label(args.agent)
         sid = state.get(f"{agent}_session_id") or ""
         ses = get_session_by_id(config, sid, directory=wt_path) if sid else None
         agent_marker = state.get(f"{agent}_task_marker", "")
@@ -1910,17 +2176,19 @@ def cmd_dispatch(args: argparse.Namespace, config: Config) -> None:
             reason = "stale (>1d)"
         if needs_recreate and args.yes:
             eprint(f"{wt_id} {agent} session {reason}; auto-creating fresh session")
-            new_ses = ensure_session(config, wt_id, wt_path, agent, recreate_existing=True)
+            new_ses = ensure_session(config, wt_id, wt_path, agent, recreate_existing=True, model_override=getattr(args, "model", None))
             sid = new_ses["id"]
-            persist_session(config, wt_id, agent, new_ses)
+            ses = new_ses
+            persist_session(config, wt_id, agent, new_ses, model_override=getattr(args, "model", None))
             # Sync the agent's task_marker so the next dispatch of the same
             # agent on the same wt_marker skips the new-task recreate.
             update_state(config, wt_id, {f"{agent}_task_marker": wt_marker})
+            state = read_state(config, wt_id)
         elif needs_recreate:
             # Preview path: no side effects (no ensure_session, no
             # persist_session, no watch_session with a fake sid). Tell the
             # user what will happen on --yes and return.
-            provider_id, model_id, variant = opencode_model(config, agent)
+            provider_id, model_id, variant = opencode_model(config, agent, override=getattr(args, "model", None))
             model_label = f"{provider_id}/{model_id}" + (f":{variant}" if variant else "")
             preview = {
                 "send": False,
@@ -1937,7 +2205,8 @@ def cmd_dispatch(args: argparse.Namespace, config: Config) -> None:
             print()
             print("确认后执行 (--yes 会自动创建 session):")
             notify_flag = f" --notify-session {args.notify_session}" if args.notify_session else ""
-            print(f"python3 scripts/session-worktree-mgr.py dispatch {args.wt_id} {agent} --task {json.dumps(args.task, ensure_ascii=False)} --yes{notify_flag}")
+            model_flag = f" --model {args.model}" if getattr(args, "model", None) else ""
+            print(f"python3 scripts/session-worktree-mgr.py dispatch {args.wt_id} {agent} --task {json.dumps(args.task, ensure_ascii=False)} --yes{notify_flag}{model_flag}")
             return
     watch_session(config, sid)
     status_map = http_json("GET", f"{config.sidecar}/status")
@@ -1955,26 +2224,40 @@ def cmd_dispatch(args: argparse.Namespace, config: Config) -> None:
                 force_recover = True
                 eprint(f"auto-recovering stuck session {sid} (busy > {STALE_DISPATCH_MS // 60000}min)")
         if force_recover:
-            delete_session(config, sid, hard=True)
+            if getattr(args, "force", False):
+                eprint(f"force: soft-archiving {session_status} session {sid} and creating a fresh session")
+            delete_session(config, sid, hard=False)
             if args.session:
-                # Main session: hard-delete old + create new + dispatch
-                new_ses = create_session(config, "main", wt_path, agent)
+                # Main session: unwatch old + create new + dispatch
+                new_ses = create_session(config, "main", wt_path, agent, model_override=getattr(args, "model", None))
                 sid = new_ses["id"]
                 ses = new_ses  # update reference for downstream persist_main_session
-                persist_main_session(config, agent, new_ses)
+                persist_main_session(config, agent, new_ses, model_override=getattr(args, "model", None))
+                main_state = read_main_state(config)
             else:
                 update_state(config, wt_id, {f"{agent}_session_id": ""})
-                new_ses = ensure_session(config, wt_id, wt_path, agent, recreate_existing=True)
+                new_ses = ensure_session(config, wt_id, wt_path, agent, recreate_existing=True, model_override=getattr(args, "model", None))
                 sid = new_ses["id"]
-                persist_session(config, wt_id, agent, new_ses)
+                ses = new_ses
+                persist_session(config, wt_id, agent, new_ses, model_override=getattr(args, "model", None))
+                state = read_state(config, wt_id)
             watch_session(config, sid)
             status_map = http_json("GET", f"{config.sidecar}/status")
             session_status = "unknown"
             if isinstance(status_map, dict):
                 session_status = str(status_map.get(sid, "unknown"))
         else:
-            fail(f"session {sid} is not dispatchable: {session_status} (use --force to hard-delete stuck session)")
-    provider_id, model_id, variant = opencode_model(config, agent)
+            fail(f"session {sid} is not dispatchable: {session_status} (use --force to unwatch stuck session and create a fresh one)")
+    elif getattr(args, "force", False):
+        eprint(f"note: --force ignored: session {sid} is {session_status}; only busy/streaming sessions are archived and recreated")
+    state_for_model = main_state if args.session else state
+    provider_id, model_id, variant = dispatch_model(
+        config,
+        agent,
+        ses,
+        override=getattr(args, "model", None),
+        state=state_for_model,
+    )
     prompt = render_prompt(wt_path, args.task.strip(), config=config)
     body: dict[str, Any] = {
         "agent": agent,
@@ -1999,11 +2282,12 @@ def cmd_dispatch(args: argparse.Namespace, config: Config) -> None:
         print()
         print("确认后执行：")
         notify_flag = f" --notify-session {args.notify_session}" if args.notify_session else ""
+        model_flag = f" --model {args.model}" if getattr(args, "model", None) else ""
         if args.session:
             # Direct session dispatch — no wt_id/agent positional args
-            print(f"python3 scripts/session-worktree-mgr.py dispatch --session {sid} --task {json.dumps(args.task, ensure_ascii=False)} --yes{notify_flag}")
+            print(f"python3 scripts/session-worktree-mgr.py dispatch --session {sid} --task {json.dumps(args.task, ensure_ascii=False)} --yes{notify_flag}{model_flag}")
         else:
-            print(f"python3 scripts/session-worktree-mgr.py dispatch {args.wt_id} {agent} --task {json.dumps(args.task, ensure_ascii=False)} --yes{notify_flag}")
+            print(f"python3 scripts/session-worktree-mgr.py dispatch {args.wt_id} {agent} --task {json.dumps(args.task, ensure_ascii=False)} --yes{notify_flag}{model_flag}")
         return
     query = urllib.parse.urlencode({"directory": str(wt_path)})
     url = f"{config.op_server}/session/{sid}/prompt_async?{query}"
@@ -2016,6 +2300,8 @@ def cmd_dispatch(args: argparse.Namespace, config: Config) -> None:
     http_json("POST", url, body, expected=(204,))
     if args.session:
         persist_main_session(config, agent, ses)  # type: ignore
+    else:
+        clear_stored_model_override(config, wt_id, agent, sid)
     disp_label = f"{wt_id}-{agent}" if not args.session else f"main-{agent}"
     print(f"dispatched -> {disp_label} ({sid}) status=accepted model={model_label} directory={wt_path}")
     notify_sid = args.notify_session or config.pm_session_id
@@ -2031,10 +2317,11 @@ def cmd_dispatch(args: argparse.Namespace, config: Config) -> None:
             max_poll_seconds=args.max_poll_seconds,
             started_at_ms=dispatch_started_at_ms,
         )
+        print("agent 完成时会异步通知（idle-watch 已挂载），无需轮询。")
 
 
 def cmd_release(args: argparse.Namespace, config: Config) -> None:
-    wt_id, wt_path = resolve_wt_id_or_path(config, args.target)
+    wt_id, wt_path = resolve_pool_wt_target(config, args.target)
     assert_worktree_root(wt_path)
     with pool_lock(config):
         if not is_clean_worktree(wt_path):
@@ -2096,22 +2383,27 @@ def cmd_session_create(args: argparse.Namespace, config: Config) -> None:
 
     By default idempotent: returns existing non-stale session if one exists.
     Sessions are rebuilt when age exceeds 1 day.  When context exceeds
-    ``MAX_MAIN_SESSION_CONTEXT`` (350K tokens) but the session is younger
-    than 1 day, auto-compact is attempted first (summarize + ping → reuse).
+    ``MAX_MAIN_SESSION_CONTEXT`` (500K tokens) but the session is younger
+    than 1 day, auto-compact is attempted first (summarize → reuse).
     ``--force`` hard-deletes the existing session and creates a fresh one
     unconditionally.
 
     If the existing session is reported by the sidecar as ``busy`` or
-    ``streaming`` (another dispatch in flight), the existing session is
-    hard-deleted and a fresh one is created — same effect as ``--force``
-    but auto-detected.  ``unknown`` status (sidecar unreachable / unwatched)
-    is treated as "cannot prove busy → safe to reuse".
+    ``streaming`` (another dispatch in flight), creation is refused — a task
+    is in flight and an automatic rebuild would silently destroy it.  An
+    explicit ``--force`` is required to hard-delete and recreate.  ``unknown``
+    status (sidecar unreachable / unwatched) is treated as "cannot prove busy
+    → safe to reuse".
     """
     check_services(config)
     agent = args.agent
     directory = Path(args.directory).expanduser().resolve() if args.directory else config.repo
     if not directory.is_dir():
         fail(f"directory not found: {directory}")
+    # Validate --model override early so a bad value exits before any
+    # destructive action (delete_session + create_session pair below).
+    if getattr(args, "model", None):
+        opencode_model(config, agent, override=args.model)
     title = f"main-{agent}"
     # If a session for this agent already exists in this PM session's state,
     # reuse it (create_session is idempotent in the sense that we only call it
@@ -2119,20 +2411,34 @@ def cmd_session_create(args: argparse.Namespace, config: Config) -> None:
     # (>1d), recreate.
     main_state = read_main_state(config)
     existing_sid = main_state.get(f"{agent}_session_id")
+    # tombstoned sessions must not be resurrected — clear the state pointer
+    # so the create path below produces a fresh session.
+    if existing_sid:
+        tombstoned = _tombstoned_sids(main_state)
+        if existing_sid in tombstoned:
+            eprint(f"tombstoned session skipped: {existing_sid}")
+            main_state[f"{agent}_session_id"] = ""
+            write_main_state(config, main_state)
+            existing_sid = None
     if existing_sid and not args.force:
         ses = get_session_by_id(config, existing_sid, directory=directory)
         if ses and not is_session_stale(ses):
             session_status = _get_session_status(config, existing_sid)
             if session_status in ("busy", "streaming"):
-                eprint(f"existing session {existing_sid} is {session_status}; auto-rebuilding (--force equivalent)...")
-                delete_session(config, existing_sid, hard=True)
-                # fall through to create_session below; do NOT early-return
-                # the existing sid since the busy session is gone.
+                # BL-TOOLCHAIN-CREATE-BUSY-DELETE: never auto-rebuild a busy
+                # session — that destroys an in-flight task without the user
+                # asking for it.  Refuse and require an explicit --force.
+                fail(
+                    f"existing session {existing_sid} ({agent}) is {session_status}; "
+                    f"refusing to auto-rebuild — a task is in flight. "
+                    f"Pass --force to hard-delete and recreate it (destroys the running task), "
+                    f"or wait until the session goes idle."
+                )
             else:
                 ctx = fetch_session_context(config, existing_sid)
                 if ctx > MAX_MAIN_SESSION_CONTEXT:
                     eprint(f"context exceeded ({ctx // 1000}K > {MAX_MAIN_SESSION_CONTEXT // 1000}K): auto-compacting {agent} {existing_sid}")
-                    result = auto_compact_session(config, existing_sid, directory, threshold=_AUTO_COMPACT_THRESHOLD, timeout=_AUTO_COMPACT_HTTP_TIMEOUT)  # type: ignore
+                    result = auto_compact_session(config, existing_sid, str(directory), threshold=_AUTO_COMPACT_THRESHOLD, timeout=_AUTO_COMPACT_HTTP_TIMEOUT)
                     if result.compacted:
                         after = fetch_session_context(config, existing_sid)
                         eprint(f"auto-compact ok: context {ctx // 1000}K → {after // 1000}K; reusing {agent} {existing_sid}")
@@ -2146,8 +2452,15 @@ def cmd_session_create(args: argparse.Namespace, config: Config) -> None:
                     eprint(f"auto-compact failed ({result.error}); rebuilding {agent} {existing_sid} (hard-delete)")
                     delete_session(config, existing_sid, hard=True)
                 else:
-                    print(json.dumps({"sessionID": existing_sid, "agent": agent, "title": title, "directory": str(directory), "status": "existing"}, ensure_ascii=False))
-                    return
+                    if getattr(args, "model", None):
+                        # --model override means the existing session (bound to
+                        # the agent's default model) is stale for the user's
+                        # intent. Force-rebuild so the override actually applies.
+                        eprint(f"--model override set: rebuilding existing session {existing_sid} (was using agent default model)")
+                        delete_session(config, existing_sid, hard=True)
+                    else:
+                        print(json.dumps({"sessionID": existing_sid, "agent": agent, "title": title, "directory": str(directory), "status": "existing"}, ensure_ascii=False))
+                        return
         elif ses:
             eprint(f"stale session archived: {agent} {existing_sid}")
             delete_session(config, existing_sid)
@@ -2160,8 +2473,8 @@ def cmd_session_create(args: argparse.Namespace, config: Config) -> None:
         # user explicitly asked for "force-replace" semantics and we
         # should be honest about the empty prior state.
         eprint("note: --force ignored: no existing session in state")
-    session = create_session(config, "main", directory, agent)
-    persist_main_session(config, agent, session)
+    session = create_session(config, "main", directory, agent, model_override=getattr(args, "model", None))
+    persist_main_session(config, agent, session, model_override=getattr(args, "model", None))
     watch_session(config, session["id"])
     print(json.dumps({"sessionID": session.get("id"), "agent": agent, "title": title, "directory": str(directory), "status": "created"}, ensure_ascii=False))
 
@@ -2207,7 +2520,7 @@ def build_pm_session_map(config: Config) -> dict[str, tuple[str, bool]]:
         state = _read_state_file(state_file)
         tombstoned = _tombstoned_sids(state)
         for key, val in state.items():
-            if key.endswith("_session_id") and val and val not in tombstoned:
+            if is_session_pointer_key(key) and val and val not in tombstoned:
                 result[val] = (pm_sid, is_current)
     return result
 
@@ -2222,22 +2535,32 @@ def write_main_state(config: Config, values: dict[str, str]) -> None:
 
 
 def update_main_state(config: Config, patch: dict[str, str]) -> dict[str, str]:
-    state = read_main_state(config)
-    state.update(patch)
-    write_main_state(config, state)
-    return state
+    return _update_state_file(_main_state_file(config), patch)
 
 
-def persist_main_session(config: Config, agent: str, session: dict[str, Any]) -> None:
+def persist_main_session(
+    config: Config,
+    agent: str,
+    session: dict[str, Any],
+    *,
+    model_override: str | None = None,
+) -> None:
     sid = str(session.get("id") or "")
     if not sid:
         fail(f"session missing id for main-{agent}")
+    patch = {
+        f"{agent}_session_id": sid,
+        f"{agent}_session_title": str(session.get("title") or f"main-{agent}"),
+        f"{agent}_model_override": "",
+        f"{agent}_model_session_id": "",
+    }
+    if model_override:
+        provider_id, model_id, variant = opencode_model(config, agent, override=model_override)
+        patch[f"{agent}_model_override"] = model_label(provider_id, model_id, variant)
+        patch[f"{agent}_model_session_id"] = sid
     update_main_state(
         config,
-        {
-            f"{agent}_session_id": sid,
-            f"{agent}_session_title": str(session.get("title") or f"main-{agent}"),
-        },
+        patch,
     )
     watch_session(config, sid)
 
@@ -2268,7 +2591,7 @@ def _filter_for_pm_ownership(config: Config, items: list[dict[str, Any]]) -> lis
     main_state = read_main_state(config)
     owned_sids: set[str] = set()
     for key, val in main_state.items():
-        if key.endswith("_session_id") and val:
+        if is_session_pointer_key(key) and val:
             owned_sids.add(str(val))
     if not owned_sids:
         return []
@@ -2343,13 +2666,42 @@ def _add_tombstone_by_session_id(config: Config, sid: str) -> list[str]:
     touched: list[str] = []
     for scope, sf in _state_files_for_all_sessions(config):
         state = _read_state_file(sf)
-        if not any(k.endswith("_session_id") and v == sid for k, v in state.items()):
+        if not any(is_session_pointer_key(k) and v == sid for k, v in state.items()):
             continue
         tombstoned = _tombstoned_sids(state)
         tombstoned.add(sid)
         state["deleted_session_ids"] = ",".join(sorted(tombstoned))
         _write_state_file(sf, state)
         touched.append(f"{scope}:{sf}")
+    return touched
+
+
+def _remove_session_pointer_by_session_id(config: Config, sid: str) -> list[str]:
+    """Hard-delete: remove every ``*_session_id`` / ``*_session_title`` / tombstone
+    entry that references ``sid`` from all persisted state files.
+
+    Returns the list of ``scope:path`` strings that were touched.
+    """
+    touched: list[str] = []
+    for scope, sf in _state_files_for_all_sessions(config):
+        state = _read_state_file(sf)
+        changed = False
+        for key, val in list(state.items()):
+            if is_session_pointer_key(key) and val == sid:
+                agent = key[: -len("_session_id")]
+                state.pop(key, None)
+                state.pop(f"{agent}_session_title", None)
+                state.pop(f"{agent}_model_override", None)
+                state.pop(f"{agent}_model_session_id", None)
+                changed = True
+        tombstoned = _tombstoned_sids(state)
+        if sid in tombstoned:
+            tombstoned.discard(sid)
+            state["deleted_session_ids"] = ",".join(sorted(tombstoned)) if tombstoned else ""
+            changed = True
+        if changed:
+            _write_state_file(sf, state)
+            touched.append(f"{scope}:{sf}")
     return touched
 
 
@@ -2447,6 +2799,8 @@ def cmd_sessions_delete(args: argparse.Namespace, config: Config) -> None:
             continue
         if not args.hard:
             _add_tombstone(config, wt_id, sid)
+        else:
+            _remove_session_pointer_by_session_id(config, sid)
         delete_session(config, sid, hard=args.hard)
         eprint(f"{'tombstoned' if not args.hard else 'deleted'} session: {sid}{' (hard)' if args.hard else ''}")
 
@@ -2552,16 +2906,22 @@ def collect_worktree_list(repo: Path) -> list[dict[str, str]]:
 
 
 def enrich_worktree_status(wt: dict[str, str]) -> None:
-    """Mutate ``wt`` with commit / dirty / ahead_main (best-effort)."""
+    """Mutate ``wt`` with commit / dirty / ahead_main (best-effort).
+
+    All git calls have a 5 s timeout so a broken worktree (stale index.lock,
+    NFS hang, etc.) does not block overview indefinitely.  KeyboardInterrupt
+    (user Ctrl+C before timeout fires) is caught and treated as a timeout so
+    the caller can continue rendering other worktrees.
+    """
     wt_path = wt["path"]
     try:
-        wt["commit"] = git(Path(wt_path), "rev-parse", "--short", "HEAD", capture=True).stdout.strip()
-    except subprocess.CalledProcessError:
+        wt["commit"] = git(Path(wt_path), "rev-parse", "--short", "HEAD", capture=True, timeout=5).stdout.strip()
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, KeyboardInterrupt):
         wt["commit"] = "?"
     try:
-        status = git(Path(wt_path), "status", "--porcelain", capture=True).stdout.strip()
+        status = git(Path(wt_path), "status", "--porcelain", capture=True, timeout=5).stdout.strip()
         wt["dirty"] = "dirty" if status else "clean"
-    except subprocess.CalledProcessError:
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, KeyboardInterrupt):
         wt["dirty"] = "?"
     try:
         # ``origin/main..HEAD`` is the count of commits reachable from HEAD
@@ -2570,9 +2930,9 @@ def enrich_worktree_status(wt: dict[str, str]) -> None:
         # triple-dot is the symmetric difference (ahead + behind), which
         # grows forever as main advances and is not what ``ahead_main``
         # claims to show.
-        ahead = git(Path(wt_path), "rev-list", "--count", "origin/main..HEAD", capture=True).stdout.strip()
+        ahead = git(Path(wt_path), "rev-list", "--count", "origin/main..HEAD", capture=True, timeout=5).stdout.strip()
         wt["ahead_main"] = ahead
-    except subprocess.CalledProcessError:
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, KeyboardInterrupt):
         wt["ahead_main"] = "?"
 
 
@@ -3063,9 +3423,14 @@ def fetch_last_reply(config: Config, session_id: str, limit: int = 50) -> str | 
         t = m.get("info", {}).get("time", {})
         return t.get("completed") or t.get("created") or 0
 
-    last = sorted(msgs, key=msg_time)[-1]
-    texts = [p.get("text", "") for p in last.get("parts", []) if p.get("type") == "text"]
-    return "".join(texts) if texts else None
+    # Backtrack: find the most recent assistant message that has text content.
+    # Tool-call-only messages (type="tool_call" parts but no type="text" parts)
+    # are skipped so PM receives the agent's actual last textual output.
+    for msg in sorted(msgs, key=msg_time, reverse=True):
+        texts = [p.get("text", "") for p in msg.get("parts", []) if p.get("type") == "text"]
+        if texts:
+            return "".join(texts)
+    return None
 
 
 def fetch_session_context(config: Config, session_id: str) -> int:
@@ -3130,11 +3495,10 @@ class CompactResult:
             compact needed" and "compact attempted but failed".
         context_before: Context tokens at decision time (input + cache.read
             from the latest step-finish). 0 if the pre-check fetch failed.
-        context_after: Always 0. Retained for backward-shape compatibility
-            with the previous (inaccurate) design; see
-            :func:`auto_compact_session` for why a post-compact fetch is
-            racy. The actual post-compact context is fetched by the caller
-            after a follow-up LLM call completes.
+        context_after: Always 0.  Callers fetch post-compact context themselves
+            after :func:`auto_compact_session` returns — /summarize is synchronous
+            so the value is immediately accurate.  This field is retained for
+            dataclass shape compatibility only.
         error: Human-readable error string when ``compacted`` is False because
             the HTTP call failed or timed out. None otherwise.
     """
@@ -3186,17 +3550,13 @@ def auto_compact_session(
     ``_idle_prompt_async`` and other op-server calls) so the summarize call
     targets the correct worktree the session was bound to.
 
-    **Post-compact context is NOT fetched here.** ``/summarize`` is processed
-    asynchronously by the op-server: a follow-up ``GET /message`` issued
-    immediately after the 2xx return would race the summary pipeline and
-    frequently return the pre-summarize token count. The caller is expected
-    to drive a real LLM call (e.g. a "ping" prompt) on the target session
-    and fetch the context after *that* busy→idle edge, by which time the
-    summary has been folded into the live message history. The
-    ``CompactResult.context_after`` field is therefore always ``0`` after
-    this function returns; it is retained in the dataclass so existing
-    callers can introspect the return shape, but no caller in this codebase
-    reads it.
+    **Post-compact context is NOT fetched here.** ``/summarize`` is synchronous
+    in the current op-server implementation — the 2xx return indicates the
+    summary has been applied.  Callers can immediately ``fetch_session_context``
+    to read the post-compact value.  The ``CompactResult.context_after`` field
+    is left at ``0`` here because fetching it would duplicate the caller's
+    concern.  All callers in this codebase independently fetch post-compact
+    context after this function returns.
     """
     if not session_id or session_id == "-":
         return CompactResult(compacted=False, error="invalid session_id")
@@ -3440,12 +3800,16 @@ def cmd_overview(args: argparse.Namespace, config: Config) -> None:
             recent_seconds = _parse_duration(recent_arg)
 
     while True:
-        payload = collect_overview(
-            config,
-            recent_seconds=recent_seconds,
-            show_all=show_all,
-            verbose=bool(getattr(args, "verbose", False)),
-        )
+        try:
+            payload = collect_overview(
+                config,
+                recent_seconds=recent_seconds,
+                show_all=show_all,
+                verbose=bool(getattr(args, "verbose", False)),
+            )
+        except KeyboardInterrupt:
+            print()
+            return
         if args.format == "json":
             print(json.dumps(payload, ensure_ascii=False, indent=2))
             if not watch_mode:
@@ -3793,12 +4157,15 @@ def _idle_prompt_async(
 
 
 def _session_has_assistant_reply_after(config: Config, session_id: str, started_at_ms: int, limit: int = 50) -> bool:
-    """Return True when the session has an assistant reply after ``started_at_ms``.
+    """Return True when the session has an assistant reply with text after ``started_at_ms``.
 
     This is used only by dispatch-spawned idle-watch as a race-condition
     fallback: if a task finishes before the watcher ever observes
     busy/streaming, the watcher can still notify exactly once after it sees
     that the target session produced a new assistant message.
+
+    Requires at least one text part with non-whitespace content (tool-call-only
+    messages are excluded to avoid false-positive idle-after-update notifies).
     """
     if started_at_ms <= 0:
         return False
@@ -3816,7 +4183,10 @@ def _session_has_assistant_reply_after(config: Config, session_id: str, started_
             continue
         t = msg.get("info", {}).get("time", {}) or {}
         msg_ms = int(t.get("completed") or t.get("created") or 0)
-        if msg_ms >= started_at_ms:
+        if msg_ms < started_at_ms:
+            continue
+        parts = msg.get("parts", [])
+        if any(p.get("type") == "text" and p.get("text", "").strip() for p in parts):
             return True
     return False
 
@@ -3871,14 +4241,10 @@ _IDLE_WATCH_STOP_TIMEOUT_DEFAULT = 3.0
 # Auto-compact threshold: when a session's most recent step-finish reports
 # ``input + cache.read`` above this number, the idle-watch fires a
 # ``POST /session/{id}/summarize`` after the busy->idle notify and then sends
-# a follow-up notify tagged ``[idle-notify:compact-done|compact-skipped|
-# compact-failed]``. Hardcoded per the Phase-1 spec — no CLI flag, since the
-# intent is a safety net, not a per-task knob. The 300K threshold is above
-# the 200K-token context window of deepseek-v4-flash-free, so it acts as a
-# last-ditch compact before the next request would be guaranteed to fail;
-# the budget matches what other toolchain scripts use to flag "context is
-# getting expensive".
-_AUTO_COMPACT_THRESHOLD = 350_000
+# a follow-up notify tagged ``[idle-notify:compact-done|compact-failed]``.
+# Hardcoded per the Phase-1 spec — no CLI flag, since the intent is a safety
+# net, not a per-task knob.
+_AUTO_COMPACT_THRESHOLD = 180_000
 _AUTO_COMPACT_HTTP_TIMEOUT = 60
 
 
@@ -4008,292 +4374,184 @@ def cmd_idle_watch(args: argparse.Namespace, config: Config) -> None:
     consecutive_errors = 0
     saw_busy_or_streaming = False
     idle_after_update_notified = False
+    idle_after_update_candidate = False  # secondary-confirmation: first-hit not yet confirmed
     busy_since: float | None = None  # monotonic timestamp when busy/streaming started
     stuck_notified = False  # only fire stuck notification once per busy streak
 
-    # Auto-compact two-phase state:
-    # phase 0 = idle-watch is observing a real user task; busy→idle edge
-    #           triggers the first PM notify, then (if context > threshold)
-    #           issues /summarize + ping + transitions to phase 1.
-    # phase 1 = a ping prompt has been dispatched; the next busy→idle edge
-    #           represents "ping has been folded into the live history", at
-    #           which point we re-fetch context (now accurate) and send the
-    #           second PM notify (compact-done / compact-skipped), then exit.
-    # compact_before carries the pre-summarize context from phase 0 into
-    # phase 1 so the second notify can report the before→after delta.
-    # phase1_saw_busy gates the compact-done fire: without it, the sidecar
-    # could still report ``idle`` for one or more ticks after the ping was
-    # queued (event ingestion lag), and we would mis-classify the very first
-    # post-ping ``idle`` observation as a busy→idle transition and fire
-    # compact-done without ever seeing the ping go busy. Track an explicit
-    # "have we actually observed busy/streaming since the ping was sent"
-    # flag so compact-done only fires after a real busy→idle edge.
-    phase = 0
+    # Auto-compact state:
+    # When a busy→idle edge fires in one-shot mode, check context and compact
+    # if above threshold.  Compact is a fire-and-forget /summarize call —
+    # no follow-up ping, no phase tracking.  The post-compact context is
+    # immediately readable (the session is idle and /summarize is synchronous).
     compact_before = 0
-    phase1_saw_busy = False
-    ping_sent_at_ms = 0  # epoch ms when the compact ping was dispatched; used to detect ping completion between polls
 
     while True:
-        if deadline is not None and time.monotonic() > deadline:
-            eprint(f"[idle-watch] max poll seconds ({max_poll_seconds}s) reached; exiting")
-            return
-        current_status = _idle_fetch_status(config, target)
+        try:
+            if deadline is not None and time.monotonic() > deadline:
+                eprint(f"[idle-watch] max poll seconds ({max_poll_seconds}s) reached; exiting")
+                return
+            current_status = _idle_fetch_status(config, target)
 
-        if current_status == "unknown" and previous_status is None and not initial_idle_notify:
-            consecutive_errors += 1
-            if consecutive_errors >= max_errors:
-                fail(f"sidecar /status returned 'unknown' for {target} after {max_errors} consecutive errors; pass --notify-if-initial-idle to send on first tick")
-            time.sleep(interval)
-            continue
-        # P1 fix: only reset the error counter on a known status. Letting the
-        # reset fire for post-baseline 'unknown' would clobber consecutive_errors
-        # every tick and prevent the post-baseline handler below from
-        # accumulating toward max_errors.
-        if current_status != "unknown":
-            consecutive_errors = 0
-        # P1 fix: post-baseline 'unknown' must NOT clobber previous_status
-        # (e.g. "busy"); otherwise a busy->idle transition that happens between
-        # the transient sidecar error and the next successful poll is masked
-        # (transition would be observed as unknown->idle, not busy->idle).
-        if current_status == "unknown" and previous_status is not None:
-            consecutive_errors += 1
-            eprint(f"[idle-watch] sidecar /status returned 'unknown' for {target} [{consecutive_errors}/{max_errors}]; keeping previous_status={previous_status!r}")
-            if consecutive_errors >= max_errors:
-                fail(f"sidecar /status returned 'unknown' for {target} after {max_errors} consecutive errors; aborting to avoid masking busy->idle transition")
-            time.sleep(interval)
-            continue
+            if current_status == "unknown" and previous_status is None and not initial_idle_notify:
+                consecutive_errors += 1
+                if consecutive_errors >= max_errors:
+                    fail(f"sidecar /status returned 'unknown' for {target} after {max_errors} consecutive errors; pass --notify-if-initial-idle to send on first tick")
+                time.sleep(interval)
+                continue
+            # P1 fix: only reset the error counter on a known status. Letting the
+            # reset fire for post-baseline 'unknown' would clobber consecutive_errors
+            # every tick and prevent the post-baseline handler below from
+            # accumulating toward max_errors.
+            if current_status != "unknown":
+                consecutive_errors = 0
+            # P1 fix: post-baseline 'unknown' must NOT clobber previous_status
+            # (e.g. "busy"); otherwise a busy->idle transition that happens between
+            # the transient sidecar error and the next successful poll is masked
+            # (transition would be observed as unknown->idle, not busy->idle).
+            if current_status == "unknown" and previous_status is not None:
+                consecutive_errors += 1
+                eprint(f"[idle-watch] sidecar /status returned 'unknown' for {target} [{consecutive_errors}/{max_errors}]; keeping previous_status={previous_status!r}")
+                if consecutive_errors >= max_errors:
+                    fail(f"sidecar /status returned 'unknown' for {target} after {max_errors} consecutive errors; aborting to avoid masking busy->idle transition")
+                time.sleep(interval)
+                continue
 
-        if current_status in ("busy", "streaming"):
-            saw_busy_or_streaming = True
-            if phase == 1:
-                # Mark that we have actually observed the post-ping busy edge.
-                # Combined with the busy→idle handler above, this is the only
-                # path that can fire compact-done; without it, the very first
-                # post-ping tick can still see ``idle`` due to sidecar event
-                # ingestion lag, and we would mis-classify it as the
-                # transition edge and emit compact-done before any real work
-                # has been observed.
-                phase1_saw_busy = True
-            if busy_since is None:
-                busy_since = time.monotonic()
-            if not stuck_notified:
-                # Use session's own time.updated (ms epoch), not watcher's
-                # busy_since. A session actively producing output refreshes
-                # its updated timestamp; only truly stalled sessions go stale.
-                ses_data = get_session_by_id(config, target)
-                if ses_data:
-                    updated_ms = int((ses_data.get("time") or {}).get("updated", 0))
-                    if updated_ms > 0 and (time.time() * 1000 - updated_ms) > STALE_DISPATCH_MS:
-                        stuck_notified = True
-                        ctx_parts = [f"target={target}"]
-                        wt_id = getattr(args, "wt_id", "")
-                        agent = getattr(args, "agent", "")
-                        if wt_id:
-                            ctx_parts.append(f"wt={wt_id}")
-                        if agent:
-                            ctx_parts.append(f"agent={agent}")
-                        ctx_parts.append(f"stale>{STALE_DISPATCH_MS // 60000}min")
-                        ctx_parts.append(f"(last updated {time.time() * 1000 - updated_ms:.0f}ms ago)")
-                        msg = f"[stuck-notify] {' '.join(ctx_parts)}"
-                        eprint(msg)
-                        _idle_prompt_async(config, notify, msg, directory=getattr(args, "directory", None), workspace=getattr(args, "workspace", None), timeout=timeout)
-        else:
-            # status changed away from busy/streaming — reset stuck tracking
-            busy_since = None
-            stuck_notified = False
-
-        should_notify = False
-        notify_reason = ""
-
-        if previous_status is None:
-            eprint(f"[idle-watch] initial status: {current_status}")
-            if initial_idle_notify and current_status == "idle":
-                should_notify = True
-                notify_reason = "initial idle (notify-if-initial-idle)"
-        elif current_status != previous_status:
-            eprint(f"[idle-watch] status changed: {previous_status} -> {current_status}")
-            if previous_status in ("busy", "streaming") and current_status == "idle":
-                should_notify = True
-                notify_reason = "busy -> idle"
-
-        if (
-            not should_notify
-            and idle_after_update_notify
-            and not saw_busy_or_streaming
-            and not idle_after_update_notified
-            and current_status == "idle"
-            and _session_has_assistant_reply_after(config, target, started_at_ms)
-        ):
-            should_notify = True
-            notify_reason = "idle after dispatch update"
-
-        if should_notify:
-            # Phase 1 post-ping suppression: a single ``busy -> idle``
-            # observation can fire on the first tick after the ping was
-            # queued, because sidecar event ingestion lags behind the
-            # ``/prompt_async`` 204 by a few hundred ms. We have not yet
-            # observed the ping go busy (phase1_saw_busy is False), so this
-            # is the sidecar catching up, not a real transition. Suppress
-            # BOTH the compact-done branch (the phase1_saw_busy guard) AND
-            # the normal notify path so we do not send a duplicate phase-0
-            # notify. Just wait for the next tick to either see busy/streaming
-            # (the ping has been picked up) or the real busy→idle edge.
-            if phase == 1 and not phase1_saw_busy and notify_reason == "busy -> idle":
-                # The poll saw idle after the ping was queued, but we never
-                # observed busy. Two possibilities: (a) sidecar event-ingestion
-                # lag — the ping hasn't been picked up yet; or (b) the ping
-                # completed (went busy→idle) entirely between this poll and the
-                # last. Distinguish by checking whether the session's
-                # time.updated has advanced past ping_sent_at_ms — if it has,
-                # the ping was processed and we can proceed to compact-done.
-                if ping_sent_at_ms > 0:
+            if current_status in ("busy", "streaming"):
+                saw_busy_or_streaming = True
+                if busy_since is None:
+                    busy_since = time.monotonic()
+                if not stuck_notified:
+                    # Use session's own time.updated (ms epoch), not watcher's
+                    # busy_since. A session actively producing output refreshes
+                    # its updated timestamp; only truly stalled sessions go stale.
                     ses_data = get_session_by_id(config, target)
                     if ses_data:
-                        ses_updated = int((ses_data.get("time") or {}).get("updated", 0))
-                        if ses_updated > ping_sent_at_ms:
-                            eprint("[idle-watch] phase 1: ping completed between polls (updated_ms advanced); un-suppressing")
-                            phase1_saw_busy = True
-                            # fall through to compact-done below
-                if not phase1_saw_busy:
-                    eprint("[idle-watch] phase 1: sidecar still reports idle after ping; waiting for real busy→idle edge")
+                        updated_ms = int((ses_data.get("time") or {}).get("updated", 0))
+                        if updated_ms > 0 and (time.time() * 1000 - updated_ms) > STALE_DISPATCH_MS:
+                            stuck_notified = True
+                            ctx_parts = [f"target={target}"]
+                            wt_id = getattr(args, "wt_id", "")
+                            agent = getattr(args, "agent", "")
+                            if wt_id:
+                                ctx_parts.append(f"wt={wt_id}")
+                            if agent:
+                                ctx_parts.append(f"agent={agent}")
+                            ctx_parts.append(f"stale>{STALE_DISPATCH_MS // 60000}min")
+                            ctx_parts.append(f"(last updated {time.time() * 1000 - updated_ms:.0f}ms ago)")
+                            msg = f"[stuck-notify] {' '.join(ctx_parts)}"
+                            eprint(msg)
+                            _idle_prompt_async(config, notify, msg, directory=getattr(args, "directory", None), workspace=getattr(args, "workspace", None), timeout=timeout)
+            else:
+                # status changed away from busy/streaming — reset stuck tracking
+                busy_since = None
+                stuck_notified = False
+
+            should_notify = False
+            notify_reason = ""
+
+            if previous_status is None:
+                eprint(f"[idle-watch] initial status: {current_status}")
+                if initial_idle_notify and current_status == "idle":
+                    should_notify = True
+                    notify_reason = "initial idle (notify-if-initial-idle)"
+            elif current_status != previous_status:
+                eprint(f"[idle-watch] status changed: {previous_status} -> {current_status}")
+                if previous_status in ("busy", "streaming") and current_status == "idle":
+                    should_notify = True
+                    notify_reason = "busy -> idle"
+
+            if (
+                not should_notify
+                and idle_after_update_notify
+                and not saw_busy_or_streaming
+                and not idle_after_update_notified
+                and current_status == "idle"
+                and _session_has_assistant_reply_after(config, target, started_at_ms)
+            ):
+                if not idle_after_update_candidate:
+                    # First hit — record candidate and wait one tick for secondary
+                    # confirmation.  Filters out false positives from sidecar event
+                    # lag (session briefly reports idle between tool calls while
+                    # still active) and tool-call-only assistant messages.
+                    idle_after_update_candidate = True
+                    eprint("[idle-watch] idle-after-update candidate (first hit); waiting one tick for confirmation")
                     previous_status = current_status
                     time.sleep(interval)
                     continue
-            # Phase 1: ping prompt_async has been folded into the target's
-            # history. Re-fetch context (now accurate — the post-summarize
-            # state is in the live message log) and emit the second notify,
-            # then exit. Race check: a single re-fetched status guards
-            # against a "user dispatched a new task between the ping
-            # completing and us reading the context" scenario, in which case
-            # the context delta would be misleading. The ``phase1_saw_busy``
-            # guard ensures we only emit compact-done after observing an
-            # actual busy→idle edge — without it, sidecar event-ingestion
-            # lag could leave the first post-ping tick reading ``idle`` and
-            # we would mis-fire compact-done before the ping ever went busy.
-            if notify_reason == "busy -> idle" and phase == 1 and phase1_saw_busy:
-                eprint("[idle-watch] phase 1 busy→idle: ping completed; verifying post-compact context")
-                ctx_after = fetch_session_context(config, target)
-                post_status = _idle_fetch_status(config, target)
-                if post_status != "idle":
-                    msg = f"[idle-notify:compact-skipped] target={target} session reused during verify (status={post_status})"
-                    eprint(f"[idle-watch] session reused during verify (status={post_status}); sending compact-skipped")
-                else:
-                    before_k = compact_before // 1000
-                    after_k = ctx_after // 1000
-                    msg = f"[idle-notify:compact-done] target={target} context {before_k}K->{after_k}K"
-                    eprint(f"[idle-watch] sending compact-done: context {before_k}K -> {after_k}K")
-                _idle_prompt_async(
+                # Second consecutive hit — confirmed.
+                should_notify = True
+                notify_reason = "idle after dispatch update"
+
+            # Reset candidate if session is no longer idle (agent may still be working)
+            if current_status != "idle":
+                idle_after_update_candidate = False
+
+            if should_notify:
+                eprint(f"[idle-watch] detected {notify_reason}, sending prompt_async to {notify}")
+                message_to_send = _build_idle_notify_message(config, target, notify_reason, custom_message)
+                ok = _idle_prompt_async(
                     config,
                     notify,
-                    msg,
+                    message_to_send,
                     directory=getattr(args, "directory", None),
                     workspace=getattr(args, "workspace", None),
                     timeout=timeout,
                 )
-                return
-
-            eprint(f"[idle-watch] detected {notify_reason}, sending prompt_async to {notify}")
-            message_to_send = _build_idle_notify_message(config, target, notify_reason, custom_message)
-            ok = _idle_prompt_async(
-                config,
-                notify,
-                message_to_send,
-                directory=getattr(args, "directory", None),
-                workspace=getattr(args, "workspace", None),
-                timeout=timeout,
-            )
-            if not ok:
-                eprint("[idle-watch] prompt_async failed; will retry next tick")
-            else:
-                eprint("[idle-watch] async prompt accepted (204)")
-                if notify_reason == "idle after dispatch update":
-                    idle_after_update_notified = True
-                if not continuous:
-                    if notify_reason == "busy -> idle":
-                        # Phase 0 first-notify accepted; now try to compact
-                        # the target's context and prepare a ping so the
-                        # next busy→idle edge is driven by a real LLM call
-                        # (giving the async /summarize pipeline time to
-                        # land in the live history). Below-threshold /
-                        # fetch-failed → silent one-shot exit, matching the
-                        # pre-auto-compact behavior. HTTP failure →
-                        # surface a compact-failed notify so the PM has
-                        # visibility into the safety-net miss.
-                        eprint(f"[idle-watch] phase 0 auto-compact check: target={target} threshold={_AUTO_COMPACT_THRESHOLD}")
-                        result = auto_compact_session(
-                            config,
-                            target,
-                            getattr(args, "directory", None),
-                            threshold=_AUTO_COMPACT_THRESHOLD,
-                            timeout=_AUTO_COMPACT_HTTP_TIMEOUT,
-                        )
-                        if not result.compacted:
-                            if result.error is None:
-                                eprint(f"[idle-watch] auto-compact not needed (context={result.context_before}); exiting (one-shot)")
-                            else:
-                                eprint(f"[idle-watch] auto-compact failed: {result.error}")
-                                fail_msg = f"[idle-notify:compact-failed] target={target} error={result.error}"
-                                _idle_prompt_async(
-                                    config,
-                                    notify,
-                                    fail_msg,
-                                    directory=getattr(args, "directory", None),
-                                    workspace=getattr(args, "workspace", None),
-                                    timeout=timeout,
-                                )
-                            return
-                        compact_before = result.context_before
-                        eprint(f"[idle-watch] compact ok: pre-context={compact_before // 1000}K; sending ping to flush summary into live history")
-                        ping_query: list[str] = []
-                        directory_val = getattr(args, "directory", None)
-                        if directory_val:
-                            ping_query.append("directory=" + urllib.parse.quote(directory_val, safe=""))
-                        ping_q = "?" + "&".join(ping_query) if ping_query else ""
-                        ping_url = f"{config.op_server}/session/{urllib.parse.quote(target)}/prompt_async{ping_q}"
-                        ping_body = {"parts": [{"type": "text", "text": "ping — 确认当前上下文大小"}]}
-                        ping_effective_timeout = int(timeout) if timeout else _IDLE_WATCH_TIMEOUT_DEFAULT
-                        try:
-                            http_json(
-                                "POST",
-                                ping_url,
-                                ping_body,
-                                expected=(204,),
-                                timeout=ping_effective_timeout,  # type: ignore
+                if not ok:
+                    eprint("[idle-watch] prompt_async failed; will retry next tick")
+                else:
+                    eprint("[idle-watch] async prompt accepted (204)")
+                    if notify_reason == "idle after dispatch update":
+                        idle_after_update_notified = True
+                    if not continuous:
+                        if notify_reason == "busy -> idle":
+                            # Phase 0 first-notify accepted; now try to compact
+                            # the target's context via /summarize (synchronous —
+                            # post-compact context is immediately readable).
+                            # Below-threshold / fetch-failed → silent one-shot
+                            # exit.  HTTP failure → compact-failed notify.
+                            eprint(f"[idle-watch] auto-compact check: target={target} threshold={_AUTO_COMPACT_THRESHOLD}")
+                            result = auto_compact_session(
+                                config,
+                                target,
+                                getattr(args, "directory", None),
+                                threshold=_AUTO_COMPACT_THRESHOLD,
+                                timeout=_AUTO_COMPACT_HTTP_TIMEOUT,
                             )
-                        except SystemExit as exc:
-                            eprint(f"[idle-watch] ping send failed: {exc}; sending compact-failed")
-                            fail_msg = f"[idle-notify:compact-failed] target={target} error=ping send failed ({exc})"
+                            if not result.compacted:
+                                if result.error is None:
+                                    eprint(f"[idle-watch] auto-compact not needed (context={result.context_before}); exiting (one-shot)")
+                                else:
+                                    eprint(f"[idle-watch] auto-compact failed: {result.error}")
+                                    fail_msg = f"[idle-notify:compact-failed] target={target} error={result.error}"
+                                    _idle_prompt_async(
+                                        config,
+                                        notify,
+                                        fail_msg,
+                                        directory=getattr(args, "directory", None),
+                                        workspace=getattr(args, "workspace", None),
+                                        timeout=timeout,
+                                    )
+                                return
+                            compact_before = result.context_before
+                            eprint(f"[idle-watch] compact ok: pre-context={compact_before // 1000}K; sending compact-done")
+                            msg = f"[idle-notify:compact-done] target={target}"
                             _idle_prompt_async(
                                 config,
                                 notify,
-                                fail_msg,
+                                msg,
                                 directory=getattr(args, "directory", None),
                                 workspace=getattr(args, "workspace", None),
                                 timeout=timeout,
                             )
                             return
-                        eprint("[idle-watch] phase 0→1: ping dispatched; waiting for next busy→idle edge to read accurate post-compact context")
-                        phase = 1
-                        ping_sent_at_ms = int(time.time() * 1000)
-                        # Force the next tick to detect busy→idle: the ping
-                        # has just been queued, so the session is about to
-                        # go busy; setting previous_status="busy" here means
-                        # the next idle observation fires the edge branch.
-                        # We `continue` (not `return`) so the existing poll
-                        # loop re-fetches and observes the transition.
-                        # Short sleep before the continue to avoid a tight
-                        # loop hammering sidecar /status: if sidecar event
-                        # ingestion lags, the next tick can also report
-                        # ``idle`` and we re-enter the phase 1 suppression
-                        # branch above — without this sleep, that path
-                        # would burn one HTTP call per loop turn.
-                        previous_status = "busy"
-                        time.sleep(0.3)
-                        continue
-                    return
+                        return
 
-        previous_status = current_status
-        time.sleep(interval)
+            previous_status = current_status
+            time.sleep(interval)
+        except Exception:
+            eprint("[idle-watch] unexpected error, aborting", exc_info=True)  # type: ignore
+            return
 
 
 def cmd_idle_watch_start(args: argparse.Namespace, config: Config) -> None:
@@ -4713,7 +4971,7 @@ def cmd_pool_repair_stuck(args: argparse.Namespace, config: Config) -> None:
     if args.task:
         prompt_text = args.task.strip() + "\n\n---\n\n" + prompt_text
     # Build dispatch body
-    provider_id, model_id, variant = opencode_model(config, agent)
+    provider_id, model_id, variant = opencode_model(config, agent, override=getattr(args, "model", None))
     body: dict[str, Any] = {
         "agent": agent,
         "model": prompt_model(provider_id, model_id),
@@ -4736,31 +4994,31 @@ def cmd_pool_repair_stuck(args: argparse.Namespace, config: Config) -> None:
         print(json.dumps(preview, ensure_ascii=False, indent=2))
         print()
         notify_flag = f" --notify-session {args.notify_session}" if args.notify_session else ""
-        print(f"python3 scripts/session-worktree-mgr.py pool repair_stuck {args.wt_id} {agent} --yes{notify_flag}")
+        model_flag = f" --model {args.model}" if getattr(args, "model", None) else ""
+        print(f"python3 scripts/session-worktree-mgr.py pool repair_stuck {args.wt_id} {agent} --yes{notify_flag}{model_flag}")
         return
-    # --yes: archive/unwatch old stuck session (or hard-delete only when --force),
-    # create fresh one, dispatch. When old session is still busy/streaming,
-    # archive is unsafe (two sessions would operate on the same worktree
-    # concurrently); require --force to hard-delete and terminate the old
-    # session first.
+    # --yes: unwatch old stuck session (soft delete), create fresh one,
+    # dispatch. When old session is still busy/streaming, unwatching is
+    # unsafe (two sessions would operate on the same worktree concurrently);
+    # require --force to override the gate and unwatch anyway.
     if old_sid:
-        hard_delete = bool(getattr(args, "force", False))
-        if old_session_status in ("busy", "streaming") and not hard_delete:
-            fail(f"old session {old_sid} is still {old_session_status}; pass --force to hard-delete it before continuing, or stop the session first")
-        delete_session(config, old_sid, hard=hard_delete)
-        if hard_delete:
-            eprint(f"hard-deleted stuck session: {old_sid}")
-        else:
-            eprint(f"archived/unwatched stuck session: {old_sid} (use --force to hard-delete)")
+        if old_session_status in ("busy", "streaming") and not bool(getattr(args, "force", False)):
+            fail(f"old session {old_sid} is still {old_session_status}; pass --force to unwatch before continuing, or stop the session first")
+        elif old_session_status in ("busy", "streaming"):
+            eprint(f"warning: old session {old_sid} is still {old_session_status}; --force unwatching anyway")
+        delete_session(config, old_sid, hard=False)
+        _add_tombstone(config, wt_id, old_sid)
+        eprint(f"archived/unwatched stuck session: {old_sid}")
     update_state(config, wt_id, {f"{agent}_session_id": ""})
-    new_ses = ensure_session(config, wt_id, wt_path, agent, recreate_existing=True)
+    new_ses = ensure_session(config, wt_id, wt_path, agent, recreate_existing=True, model_override=getattr(args, "model", None))
     sid = new_ses["id"]
-    persist_session(config, wt_id, agent, new_ses)
+    persist_session(config, wt_id, agent, new_ses, model_override=getattr(args, "model", None))
     watch_session(config, sid)
     query = urllib.parse.urlencode({"directory": str(wt_path)})
     url = f"{config.op_server}/session/{sid}/prompt_async?{query}"
     dispatch_started_at_ms = int(time.time() * 1000)
     http_json("POST", url, body, expected=(204,))
+    clear_stored_model_override(config, wt_id, agent, sid)
     print(f"continued -> {wt_id}-{agent} ({sid}) branch={branch} model={model_label} directory={wt_path}")
     notify_sid = args.notify_session or config.pm_session_id
     if notify_sid:
@@ -4824,6 +5082,7 @@ def cmd_session_dispatch(args: argparse.Namespace, config: Config) -> None:
         notify_session=args.notify_session,
         require_no_busy=args.require_no_busy,
         max_poll_seconds=args.max_poll_seconds,
+        model=getattr(args, "model", None),
     )
     cmd_dispatch(ns, config)
 
@@ -4843,13 +5102,16 @@ def cmd_session_delete(args: argparse.Namespace, config: Config) -> None:
         print()
         print("确认删除后加 --yes")
         return
-    if not args.hard:
+    if args.hard:
+        state_touched = _remove_session_pointer_by_session_id(config, sid)
+    else:
         state_touched = _add_tombstone_by_session_id(config, sid)
         if not state_touched:
             eprint(f"warning: no persisted state pointer found for {sid}; soft delete will only unwatch it")
     delete_session(config, sid, hard=args.hard)
     if state_touched:
-        eprint(f"tombstoned in state: {', '.join(state_touched)}")
+        label = "cleaned from state" if args.hard else "tombstoned in state"
+        eprint(f"{label}: {', '.join(state_touched)}")
     eprint(f"{'deleted' if args.hard else 'tombstoned'} session: {sid}{' (hard)' if args.hard else ''}")
 
 
@@ -4895,6 +5157,7 @@ def _add_dispatch_options(
     *,
     allow_session: bool,
     task_required: bool = True,
+    force_help: str | None = None,
 ) -> None:
     if allow_session:
         parser.add_argument("--session", default=None, help=argparse.SUPPRESS)
@@ -4905,7 +5168,11 @@ def _add_dispatch_options(
         # is omitted; --task is an optional override on top of it.
         parser.add_argument("--task", default="", help="Optional task override. If omitted, the continuation prompt is auto-generated.")
     parser.add_argument("--yes", action="store_true", help="Actually send the prompt. Without this flag, print a preview only.")
-    parser.add_argument("--force", action="store_true", help="Hard-delete stuck session and create a fresh one before dispatching.")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help=force_help or "For busy/streaming sessions, soft-archive and recreate; healthy idle/unknown sessions are reused.",
+    )
     parser.add_argument(
         "--notify-session",
         default=env("PM_CURRENT_SESSION_ID", ""),
@@ -4921,6 +5188,11 @@ def _add_dispatch_options(
         type=float,
         default=0,
         help="Max poll seconds for auto idle-watch. 0 = unlimited. Recommended: 1800 for long backend tasks.",
+    )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help=("Override session/prompt model. Format: 'providerID/modelID' or 'providerID/modelID:variant'. Default: read from agent definition in opencode.json."),
     )
 
 
@@ -5086,7 +5358,12 @@ Use cases:
     pool_continue = pool_sub.add_parser("repair_stuck", help="Repair a stuck session — archive old, create new session on same branch, auto-generate continuation prompt.")
     pool_continue.add_argument("wt_id", help="Pool worktree id, e.g. wt_1")
     pool_continue.add_argument("agent", help="Agent name, e.g. Daedalus")
-    _add_dispatch_options(pool_continue, allow_session=False, task_required=False)
+    _add_dispatch_options(
+        pool_continue,
+        allow_session=False,
+        task_required=False,
+        force_help="Allow repair_stuck to archive a busy/streaming old session; repair_stuck always recreates.",
+    )
     pool_continue.set_defaults(func=cmd_pool_repair_stuck, session=None)
 
     pool_release = pool_sub.add_parser("release", help="Reset a task worktree and mark it idle.")
@@ -5173,13 +5450,18 @@ Right:
     sessions_create.add_argument(
         "--force",
         action="store_true",
-        help="Hard-delete persisted existing session and create a new one. Without --force, stale/oversized/busy sessions are auto-rebuilt.",
+        help="Hard-delete the existing session and create a new one. Without --force, busy/streaming sessions refuse creation; stale/oversized sessions are auto-rebuilt.",
     )
     sessions_create.add_argument("--directory", default=None, help="Directory for the session. Default: repo root.")
     sessions_create.add_argument(
         "--pm-session-id",
         default=None,
         help=("Override the current PM session scope (default: $PM_SESSION_ID or .pm/pm-session-info.json). Used for per-PM main.state isolation (P1-3)."),
+    )
+    sessions_create.add_argument(
+        "--model",
+        default=None,
+        help=("Override session model. Format: 'providerID/modelID' or 'providerID/modelID:variant'. Default: read from agent definition in opencode.json."),
     )
     sessions_create.set_defaults(func=cmd_session_create)
 

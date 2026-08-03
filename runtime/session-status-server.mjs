@@ -172,14 +172,25 @@ async function resolveEffectiveStatus(sessionID, item) {
     if (status && status !== "unknown") return status
 
     // status is "unknown" or undefined: apply fallback rule.
-    // Lazy fetch OpenCode session tokens.input — if > 0, the session has
-    // produced LLM output at some point, so sidecar's missing status is
-    // almost certainly lost state (restart / missed event), not "fresh".
-    // Treat as idle so dispatch can proceed safely.
+    // Lazy fetch OpenCode session metadata — if the fetch succeeds (i.e. the
+    // response carries the session ``id``), the session exists on the
+    // OpenCode server and tokens can be inspected. Tokens.input > 0 means
+    // the session has produced LLM output at some point, so sidecar's
+    // missing status is almost certainly lost state (restart / missed
+    // event), not "fresh" — treat as idle so dispatch can proceed safely.
+    //
+    // The previous implementation only checked ``if (tokens)``; in JS
+    // ``{}`` is truthy, so a brand-new session whose ``tokens`` came back
+    // as an empty object was misclassified as idle. The ``sessionData.id``
+    // guard ensures we have a real session record before trusting the
+    // fallback, and a separate check distinguishes "session exists, zero
+    // tokens yet" (→ idle) from "fetch failed / empty response" (→ unknown).
     let tokens = item.tokens
+    let sessionData = null
+    let fetchSucceeded = false
     if (!tokens && !item.tokensFetched) {
         try {
-            const sessionData = await fetchJson(
+            sessionData = await fetchJson(
                 `${OPENCODE_SERVER}/session/${encodeURIComponent(sessionID)}`
             )
             tokens = (sessionData && sessionData.tokens) || {}
@@ -188,6 +199,7 @@ async function resolveEffectiveStatus(sessionID, item) {
                 tokens,
                 tokensFetched: now(),
             })
+            fetchSucceeded = !!(sessionData && sessionData.id)
         } catch (err) {
             log("warn", "tokens fetch failed for fallback rule", {
                 sessionID,
@@ -195,9 +207,13 @@ async function resolveEffectiveStatus(sessionID, item) {
             })
             // 不写 tokensFetched，允许下次 /status 请求重试
         }
+    } else if (item.tokens && item.tokensFetched) {
+        // Previously fetched — we already validated the session record at
+        // that time, so trust the cached tokens here.
+        fetchSucceeded = true
     }
 
-    if ((tokens && tokens.input) > 0) {
+    if (fetchSucceeded) {
         return "idle"
     }
     return "unknown"

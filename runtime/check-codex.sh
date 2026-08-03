@@ -2,76 +2,24 @@
 # check-codex.sh — 拉取 PR 上 Codex bot 的审查 comments
 #
 # 用法：
-#   bash scripts/check-codex.sh <PR_NUMBER>                  # 输出 Markdown
-#   bash scripts/check-codex.sh <PR_NUMBER> --json           # 输出 JSON
-#   bash scripts/check-codex.sh <PR_NUMBER> --count          # 只输出计数
-#   bash scripts/check-codex.sh <PR_NUMBER> --repo OWNER/REPO  # 显式指定 repo (默认从 git remote 推断)
+#   bash scripts/check-codex.sh <PR_NUMBER>           # 输出 Markdown
+#   bash scripts/check-codex.sh <PR_NUMBER> --json    # 输出 JSON
+#   bash scripts/check-codex.sh <PR_NUMBER> --count   # 只输出计数
 #
 # 由 Themis 在审查流程 Step 1.5 调用，PM 也可手工运行。
-#
-# 跨项目支持 (per devkit review B2 修复): repo 默认从 `git remote get-url origin`
-# 推断; 也可通过 --repo 参数或 PM_CODEX_REPO 环境变量显式指定.
-# 部署到新项目时无需改 hardcoded `aykgb/xidi-minimal`.
 
 set -euo pipefail
 
 PR_NUMBER="${1:-}"
 FLAG="${2:---markdown}"
-REPO_OVERRIDE=""
-
-# 解析参数: 第 1 个是 PR_NUMBER, 第 2 个可能是 FLAG 或 --repo OWNER/REPO
-# 支持 `check-codex.sh <PR> --repo OWNER/REPO` 或 `check-codex.sh <PR> --markdown --repo OWNER/REPO`
-shift_args=()
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --repo)
-            REPO_OVERRIDE="$2"
-            shift 2
-            ;;
-        --json|--markdown|--count)
-            shift_args+=("$1")
-            shift
-            ;;
-        *)
-            shift_args+=("$1")
-            shift
-            ;;
-    esac
-done
-# 重建位置参数
-set -- "${shift_args[@]:-}"
-PR_NUMBER="${1:-}"
-FLAG="${2:---markdown}"
 
 if [[ -z "$PR_NUMBER" ]]; then
-    echo "用法: bash scripts/check-codex.sh <PR_NUMBER> [--json|--markdown|--count] [--repo OWNER/REPO]" >&2
+    echo "用法: bash scripts/check-codex.sh <PR_NUMBER> [--json|--markdown|--count]" >&2
     exit 2
 fi
 
-# 推断 REPO: --repo > PM_CODEX_REPO 环境变量 > git remote get-url origin
-if [[ -n "$REPO_OVERRIDE" ]]; then
-    REPO="$REPO_OVERRIDE"
-elif [[ -n "${PM_CODEX_REPO:-}" ]]; then
-    REPO="$PM_CODEX_REPO"
-else
-    # 从 git remote 推断 OWNER/REPO
-    REMOTE_URL=$(git remote get-url origin 2>/dev/null || echo "")
-    if [[ -z "$REMOTE_URL" ]]; then
-        echo "❌ 无法推断 repo: 未传 --repo、未设 PM_CODEX_REPO、且无 git remote origin" >&2
-        echo "   用法: bash scripts/check-codex.sh <PR> --repo OWNER/REPO" >&2
-        exit 2
-    fi
-    # 支持 SSH (git@github.com:OWNER/REPO.git) 和 HTTPS (https://github.com/OWNER/REPO.git)
-    REPO=$(echo "$REMOTE_URL" | sed -E 's#^(git@github\.com:|https?://github\.com/)##; s#\.git$##')
-    if [[ -z "$REPO" ]] || [[ "$REPO" == *"@"* ]]; then
-        echo "❌ 无法从 remote URL 解析 OWNER/REPO: $REMOTE_URL" >&2
-        echo "   用法: bash scripts/check-codex.sh <PR> --repo OWNER/REPO" >&2
-        exit 2
-    fi
-fi
-
 # 拉取 PR review comments
-COMMENTS_JSON=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/comments" 2>/dev/null || true)
+COMMENTS_JSON=$(gh api "repos/aykgb/xidi-minimal/pulls/${PR_NUMBER}/comments" 2>/dev/null || true)
 
 if [[ -z "$COMMENTS_JSON" ]] || [[ "$COMMENTS_JSON" == "[]" ]]; then
     case "$FLAG" in
