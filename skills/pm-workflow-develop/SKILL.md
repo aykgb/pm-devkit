@@ -68,5 +68,3 @@ PM 专用 skill——标准 7 步特性开发流水线。权威源：[`docs/deve
 ## 流程裁减
 
 开发者可按 OC5.8 裁减步骤（跳过 Themis / Codex / QA 部分或全部）。PM 照办。
-
-Base directory for this skill: /Users/clark/xidi-minimal/.opencode/skills/pm-workflow-feature

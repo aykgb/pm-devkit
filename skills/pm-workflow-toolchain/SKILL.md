@@ -80,5 +80,3 @@ PM 专用 skill——工具链轻量闭环。权威源：[`docs/development_work
 | `.opencode/` 下 `.py` `.mjs` `.js` | `.opencode/` 下 `*.md`（走 `pm-workflow-doc-refactor`） |
 | 工具链 bug ≤500 行 | `.pm/` `docs/` `*.md`（PM 直推 iter，OC2.7） |
 | 工具链 bug ≤500 行 | 工具链改动 >500 行（升格标准 7 步） |
-
-Base directory for this skill: /Users/clark/xidi-minimal/.opencode/skills/pm-workflow-toolchain
