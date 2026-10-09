@@ -38,24 +38,25 @@ const DEFAULT_CONFIG = Object.freeze({
     runtimeLogConfigPollIntervalMs: 10000,
 });
 
+export default {
+    id: SERVICE,
+    setup,
+};
+
 /**
- * PMGuardianPlugin
+ * PMGuardianPlugin (OpenCode V2 plugin API)
  *
  * Behavior:
- * 1. event hook captures sessionID -> agent mapping.
- * 2. experimental.chat.system.transform uses input.sessionID as source of truth.
- * 3. Only targetAgent receives PM session info + instruct markdown.
- * 4. system prompt-affecting config is frozen at process startup.
- * 5. instruct markdown files are loaded once at process startup.
- * 6. runtime log/debug config is refreshed every 10 seconds.
- * 7. persona.md is no longer a separate injection path; it is just the first
+ * 1. session context hook uses event.sessionID / event.agent as source of truth.
+ * 2. Only targetAgent receives PM session info + instruct markdown.
+ * 3. system prompt-affecting config is frozen at process startup.
+ * 4. instruct markdown files are loaded once at process startup.
+ * 5. runtime log/debug config is refreshed every 10 seconds.
+ * 6. persona.md is no longer a separate injection path; it is just the first
  *    default instruct markdown file.
  */
-export const PMGuardianPlugin = async (context) => {
-    const { client, directory } = context;
-
-    // sessionID -> agent
-    const sessionAgents = new Map();
+async function setup(ctx) {
+    const directory = ctx.location.directory;
 
     const pmDir = path.join(directory, ".pm");
 
@@ -103,18 +104,8 @@ export const PMGuardianPlugin = async (context) => {
             return;
         }
 
-        try {
-            await client.app.log({
-                body: {
-                    service: SERVICE,
-                    level,
-                    message,
-                    extra,
-                },
-            });
-        } catch (_) {
-            // OpenCode app logging is optional. JSONL logging above is primary.
-        }
+        // V2 plugin context has no client.app.log endpoint; use console instead.
+        console.log(`[${SERVICE}] ${level} ${message}`, extra);
     };
 
     async function loadConfigOnce() {
@@ -413,145 +404,104 @@ export const PMGuardianPlugin = async (context) => {
         })),
     });
 
-    startRuntimeLogConfigWatcher();
+    const runtimeLogConfigTimer = startRuntimeLogConfigWatcher();
 
-    return {
-        event: async ({ event }) => {
-            try {
-                const result = rememberSessionAgent(event, sessionAgents);
+    await ctx.session.hook("context", async (event) => {
+        try {
+            const sessionID = String(event?.sessionID || "");
+            const agent = String(event?.agent || "").toLowerCase();
 
-                if (!result) {
-                    return;
-                }
-
-                if (result.action === "created") {
-                    await logMessage(DEBUG, "Captured session agent mapping", result);
-                    return;
-                }
-
-                if (result.action === "conflict") {
-                    await logMessage(WARN, "Ignored conflicting session agent mapping", result);
-                    return;
-                }
-
-                if (runtimeLogConfig.debugDump && result.action === "exists") {
-                    await logMessage(DEBUG, "Session agent mapping already exists", result);
-                }
-            } catch (err) {
-                await logMessage(ERROR, "event hook failed", {
-                    error: String(err),
-                    stack: err?.stack,
+            if (runtimeLogConfig.debugDump) {
+                await logMessage(DEBUG, "context hook input schema", {
+                    sessionID,
+                    agent,
+                    inputSchema: dumpStructure(event),
+                    systemHead: previewSystemHead(event?.system),
+                    promptConfig: redactPromptConfigForLog(frozenPromptConfig),
+                    runtimeLogConfig,
                 });
             }
-        },
 
-        "experimental.chat.system.transform": async (input, output) => {
-            try {
-                const sessionID = String(input?.sessionID || "");
+            if (!sessionID) {
+                await logMessage(WARN, "Skipped PM instruct injection: missing sessionID", {
+                    inputSchema: runtimeLogConfig.debugDump
+                        ? dumpStructure(event)
+                        : undefined,
+                });
 
+                return;
+            }
+
+            if (agent !== frozenPromptConfig.targetAgent) {
                 if (runtimeLogConfig.debugDump) {
-                    await logMessage(DEBUG, "transform input schema", {
+                    await logMessage(DEBUG, "Skipped PM session/instruct injection: non-target agent", {
                         sessionID,
-                        inputSchema: dumpStructure(input),
-                        outputSystemHead: previewSystemHead(output?.system),
-                        promptConfig: redactPromptConfigForLog(frozenPromptConfig),
-                        runtimeLogConfig,
+                        agent: agent || "<missing>",
+                        targetAgent: frozenPromptConfig.targetAgent,
                     });
                 }
 
-                if (!sessionID) {
-                    await logMessage(WARN, "Skipped PM instruct injection: missing sessionID", {
-                        inputSchema: runtimeLogConfig.debugDump
-                            ? dumpStructure(input)
-                            : undefined,
-                    });
-
-                    return output;
-                }
-
-                if (isInternalTitleGeneration(output)) {
-                    await logMessage(DEBUG, "Skipped PM session/instruct injection for internal title generation", {
-                        sessionID,
-                    });
-
-                    return output;
-                }
-
-                const agent = sessionAgents.get(sessionID);
-
-                if (agent !== frozenPromptConfig.targetAgent) {
-                    if (runtimeLogConfig.debugDump) {
-                        await logMessage(DEBUG, "Skipped PM session/instruct injection: non-target agent", {
-                            sessionID,
-                            agent: agent || "<missing>",
-                            targetAgent: frozenPromptConfig.targetAgent,
-                        });
-                    }
-
-                    return output;
-                }
-
-                output.system = normalizeSystem(output?.system);
-
-                const guard = await guardAndPersistCurrentSession({
-                    sessionID,
-                    agent,
-                    input,
-                });
-
-                const beforeSystemHead = previewSystemHead(output.system);
-
-                const sessionInfoInjected = !hasSessionInfo(output.system);
-
-                if (sessionInfoInjected) {
-                    output.system.push(wrapSessionInfo(guard.record, frozenPromptConfig));
-                }
-
-                const injectedInstructs = [];
-                const skippedInstructs = [];
-                let afterSystemHead = beforeSystemHead;
-
-                if (guard.allowed) {
-                    for (const section of frozenInstructSections) {
-                        if (hasInstructSource(output.system, section.sourceID)) {
-                            skippedInstructs.push(section.configuredPath);
-                            continue;
-                        }
-
-                        output.system.push(wrapInstruct(section));
-                        injectedInstructs.push(section.configuredPath);
-                    }
-
-                    afterSystemHead = previewSystemHead(output.system);
-                }
-
-                await logMessage(DEBUG, "Injected PM session/instruct info", {
-                    sessionID,
-                    agent,
-                    targetAgent: frozenPromptConfig.targetAgent,
-                    systemItems: output.system.length,
-                    sessionInfoPath: getSessionInfoPath(),
-                    sessionGuardAction: guard.action,
-                    sessionInfoInjected,
-                    instructFiles: frozenPromptConfig.instructFiles,
-                    injectedInstructs,
-                    skippedInstructs,
-                    beforeSystemHead,
-                    afterSystemHead,
-                });
-
-                return output;
-            } catch (err) {
-                await logMessage(ERROR, "transform hook failed", {
-                    error: String(err),
-                    stack: err?.stack,
-                });
-
-                return output;
+                return;
             }
-        },
-    };
-};
+
+            normalizeSystemSegments(event);
+
+            const guard = await guardAndPersistCurrentSession({
+                sessionID,
+                agent,
+                input: event,
+            });
+
+            const beforeSystemHead = previewSystemHead(event.system);
+
+            const sessionInfoInjected = !hasSessionInfo(event.system);
+
+            if (sessionInfoInjected) {
+                event.system.push(textSegment(wrapSessionInfo(guard.record, frozenPromptConfig)));
+            }
+
+            const injectedInstructs = [];
+            const skippedInstructs = [];
+            let afterSystemHead = beforeSystemHead;
+
+            if (guard.allowed) {
+                for (const section of frozenInstructSections) {
+                    if (hasInstructSource(event.system, section.sourceID)) {
+                        skippedInstructs.push(section.configuredPath);
+                        continue;
+                    }
+
+                    event.system.push(textSegment(wrapInstruct(section)));
+                    injectedInstructs.push(section.configuredPath);
+                }
+
+                afterSystemHead = previewSystemHead(event.system);
+            }
+
+            await logMessage(DEBUG, "Injected PM session/instruct info", {
+                sessionID,
+                agent,
+                targetAgent: frozenPromptConfig.targetAgent,
+                systemItems: event.system.length,
+                sessionInfoPath: getSessionInfoPath(),
+                sessionGuardAction: guard.action,
+                sessionInfoInjected,
+                instructFiles: frozenPromptConfig.instructFiles,
+                injectedInstructs,
+                skippedInstructs,
+                beforeSystemHead,
+                afterSystemHead,
+            });
+        } catch (err) {
+            await logMessage(ERROR, "context hook failed", {
+                error: String(err),
+                stack: err?.stack,
+            });
+        }
+    });
+
+    return () => clearInterval(runtimeLogConfigTimer);
+}
 
 function buildInitialConfig() {
     return normalizeGuardianConfig({
@@ -713,67 +663,43 @@ function redactPromptConfigForLog(config) {
 }
 
 /**
- * Capture sessionID -> agent mapping from OpenCode events.
- *
- * Policy:
- * - First valid mapping wins.
- * - Later conflicting mappings are logged but ignored.
+ * Ensure event.system holds text segments in place.
  */
-function rememberSessionAgent(event, sessionAgents) {
-    const eventType = String(event?.type || event?.name || "<unknown>");
-    const info = event?.properties?.info;
-
-    const sessionID = String(info?.sessionID || "");
-    const agent = String(info?.agent || "").toLowerCase();
-
-    if (!sessionID || !agent) {
-        return null;
+function normalizeSystemSegments(event) {
+    if (Array.isArray(event.system)) {
+        return event.system;
     }
 
-    const previous = sessionAgents.get(sessionID);
+    event.system = event.system === null || event.system === undefined || event.system === ""
+        ? []
+        : [textSegment(event.system)];
 
-    if (!previous) {
-        sessionAgents.set(sessionID, agent);
+    return event.system;
+}
 
-        return {
-            action: "created",
-            eventType,
-            sessionID,
-            agent,
-        };
-    }
-
-    if (previous !== agent) {
-        return {
-            action: "conflict",
-            eventType,
-            sessionID,
-            previous,
-            agent,
-        };
-    }
-
+/**
+ * Build a text segment for the V2 system prompt parts array.
+ */
+function textSegment(text) {
     return {
-        action: "exists",
-        eventType,
-        sessionID,
-        agent,
+        type: "text",
+        text: String(text),
     };
 }
 
 /**
- * Normalize output.system to an array of string-like system segments.
+ * Read the text of a V2 system segment, tolerating plain strings.
  */
-function normalizeSystem(system) {
-    if (Array.isArray(system)) {
-        return system;
+function segmentText(segment) {
+    if (typeof segment === "string") {
+        return segment;
     }
 
-    if (system === null || system === undefined || system === "") {
-        return [];
+    if (segment && typeof segment === "object" && typeof segment.text === "string") {
+        return segment.text;
     }
 
-    return [String(system)];
+    return "";
 }
 
 /**
@@ -781,11 +707,11 @@ function normalizeSystem(system) {
  */
 function hasSessionInfo(system) {
     if (!Array.isArray(system)) {
-        return String(system || "").includes(SESSION_MARKER);
+        return segmentText(system).includes(SESSION_MARKER);
     }
 
     return system.some((item) =>
-        String(item || "").includes(SESSION_MARKER)
+        segmentText(item).includes(SESSION_MARKER)
     );
 }
 
@@ -796,28 +722,12 @@ function hasInstructSource(system, sourceID) {
     const needle = `${INSTRUCT_MARKER} id="${sourceID}"`;
 
     if (!Array.isArray(system)) {
-        return String(system || "").includes(needle);
+        return segmentText(system).includes(needle);
     }
 
     return system.some((item) =>
-        String(item || "").includes(needle)
+        segmentText(item).includes(needle)
     );
-}
-
-/**
- * Internal title generation should not receive PM session/instruct info.
- */
-function isInternalTitleGeneration(output) {
-    const text = Array.isArray(output?.system)
-        ? output.system.slice(0, 3).map(String).join("\n")
-        : String(output?.system || "");
-
-    return text.includes("You are a title generator")
-        && (
-            text.includes("Generate a brief title")
-            || text.includes("Generate a title for this conversation")
-            || text.includes("thread title")
-        );
 }
 
 /**
@@ -1331,14 +1241,18 @@ function previewSystemHead(system, maxItems = 3, maxChars = 500) {
     if (!Array.isArray(system)) {
         return {
             type: typeof system,
-            value: String(system || "").slice(0, maxChars),
+            value: segmentText(system).slice(0, maxChars),
         };
     }
 
-    return system.slice(0, maxItems).map((item, index) => ({
-        index,
-        type: typeof item,
-        preview: String(item || "").slice(0, maxChars),
-        size: String(item || "").length,
-    }));
+    return system.slice(0, maxItems).map((item, index) => {
+        const text = segmentText(item);
+
+        return {
+            index,
+            type: typeof item,
+            preview: text.slice(0, maxChars),
+            size: text.length,
+        };
+    });
 }
